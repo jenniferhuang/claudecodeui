@@ -19,6 +19,7 @@ type ShellIncomingMessage = {
   initialCommand?: string;
   isPlainShell?: boolean;
   forceRestart?: boolean;
+  attachOnly?: boolean;
   bypassPermissions?: boolean;
   colorScheme?: string;
 };
@@ -32,6 +33,10 @@ type PtySessionEntry = {
   timeoutId: NodeJS.Timeout | null;
   projectPath: string;
   sessionId: string | null;
+  provider: string;
+  providerSessionId: string | null;
+  // Keep ownership until onExit confirms the process has released its writer.
+  terminating: boolean;
   // The app theme a Claude CLI in this pty was launched for; null for any other
   // program. A running CLI keeps its launch-time colours, so a reattaching
   // client needs this, not its own current theme, to know if they differ.
@@ -42,6 +47,15 @@ const ptySessionsMap = new Map<string, PtySessionEntry>();
 const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
 const SHELL_URL_PARSE_BUFFER_LIMIT = 32768;
 const TRAILING_URL_PUNCTUATION_REGEX = /[)\]}>.,;:!?]+$/;
+
+/** Used by Chat admission and Shell launches to prevent two writers for one Codex thread, including native-id aliases. */
+export function hasActiveCodexShellSession(sessionId: string, providerSessionId?: string | null): boolean {
+  const ids = new Set([sessionId, providerSessionId].filter(Boolean));
+  return Array.from(ptySessionsMap.values()).some((entry) => entry.provider === 'codex' && (
+    (entry.sessionId !== null && ids.has(entry.sessionId)) ||
+    (entry.providerSessionId !== null && ids.has(entry.providerSessionId))
+  ));
+}
 
 function normalizeDetectedUrl(url: string): string | null {
   const cleanedUrl = url.trim().replace(TRAILING_URL_PUNCTUATION_REGEX, '');
@@ -120,6 +134,8 @@ type ShellWebSocketDependencies = {
     provider: string,
   ) => string | null | undefined;
   spawnPty?: typeof pty.spawn;
+  /** Supplied by the websocket gateway so Shell cannot interrupt Chat or its background work. */
+  isChatSessionRunning?: (sessionId: string, providerSessionId: string | null) => boolean;
 };
 
 /**
@@ -234,13 +250,10 @@ function buildShellCommand(
   }
 
   if (provider === 'codex') {
-    if (resumeSessionId) {
-      if (os.platform() === 'win32') {
-        return otherProgram(`codex resume "${resumeSessionId}"; if ($LASTEXITCODE -ne 0) { codex }`);
-      }
-      return otherProgram(`codex resume "${resumeSessionId}" || codex`);
-    }
-    return otherProgram('codex');
+    // Own the runtime instead of subscribing to a shared daemon that can keep
+    // the writer after this PTY exits. A failed resume must not start a new history.
+    const executable = os.platform() === 'win32' ? 'codex' : 'exec codex';
+    return otherProgram(`${executable} --no-daemon${resumeSessionId ? ` resume "${resumeSessionId}"` : ''}`);
   }
 
   if (provider === 'opencode') {
@@ -546,12 +559,19 @@ export function handleShellConnection(
       }
 
       if (data.type === 'init') {
+        if (shellProcess) {
+          ws.send(JSON.stringify({ type: 'error', message: 'This socket already has a terminal. Reconnect to change sessions.' }));
+          return;
+        }
         const projectPath = readString(data.projectPath, process.cwd());
         const sessionId = readString(data.sessionId) || null;
         const hasSession = readBoolean(data.hasSession);
         const provider = readString(data.provider, 'claude');
         const initialCommand = readString(data.initialCommand);
         const forceRestart = readBoolean(data.forceRestart);
+        // Missing intent from older pages is attachment-only too: simply
+        // mounting the Shell tab must never create a Codex writer.
+        const attachOnly = provider === 'codex' && !readBoolean(data.isPlainShell) && data.attachOnly !== false;
         const colorScheme = readColorScheme(data.colorScheme);
         const isPlainShell =
           readBoolean(data.isPlainShell) ||
@@ -571,7 +591,17 @@ export function handleShellConnection(
           isPlainShell && initialCommand
             ? `_cmd_${Buffer.from(initialCommand).toString('base64').slice(0, 16)}`
             : '';
-        ptySessionKey = `${projectPath}_${sessionId ?? 'default'}${commandSuffix}`;
+        ptySessionKey = `${isPlainShell ? 'plain-shell' : provider}_${projectPath}_${sessionId ?? 'default'}${commandSuffix}`;
+
+        const retainedSession = ptySessionsMap.get(ptySessionKey);
+        if (retainedSession?.terminating) {
+          ws.send(JSON.stringify({ type: 'error', message: 'This terminal is stopping. Wait for it to exit before reconnecting.' }));
+          return;
+        }
+        if ((isLoginCommand || forceRestart) && retainedSession?.provider === 'codex') {
+          ws.send(JSON.stringify({ type: 'error', message: 'End the existing Codex Shell and wait for it to exit before connecting again.' }));
+          return;
+        }
 
         if (isLoginCommand || forceRestart) {
           const oldSession = ptySessionsMap.get(ptySessionKey);
@@ -616,6 +646,26 @@ export function handleShellConnection(
           return;
         }
 
+        if (attachOnly && !isPlainShell) {
+          ws.send(JSON.stringify({ type: 'session_unavailable' }));
+          if (data.attachOnly === undefined) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Refresh CloudCLI, then click Connect to start Codex Shell.' }));
+          }
+          return;
+        }
+
+        const resumeSessionId = resolveResumeSessionId(data, dependencies);
+        if (provider === 'codex' && !isPlainShell) {
+          if (hasActiveCodexShellSession(sessionId ?? '', resumeSessionId)) {
+            ws.send(JSON.stringify({ type: 'error', code: 'SHELL_SESSION_ACTIVE', message: 'This Codex thread already has a Shell in another workspace. End that Shell before switching.' }));
+            return;
+          }
+          if (sessionId && dependencies.isChatSessionRunning?.(sessionId, resumeSessionId || null)) {
+            ws.send(JSON.stringify({ type: 'error', code: 'CHAT_SESSION_ACTIVE', message: 'Chat is still running for this Codex session. Wait for its turn and background tasks to finish, then reconnect.' }));
+            return;
+          }
+        }
+
         const resolvedProjectPath = path.resolve(projectPath);
         try {
           const stats = fs.statSync(resolvedProjectPath);
@@ -638,7 +688,6 @@ export function handleShellConnection(
           dependencies,
           resolvedProjectPath,
         );
-        const resumeSessionId = resolveResumeSessionId(data, dependencies);
         const claudeColorScheme = claudeFollowsAppTheme ? colorScheme : null;
         const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
         const shellArgs =
@@ -672,16 +721,24 @@ export function handleShellConnection(
           timeoutId: null,
           projectPath,
           sessionId,
+          provider: isPlainShell ? 'plain-shell' : provider,
+          providerSessionId: resumeSessionId || null,
+          terminating: false,
           claudeColorScheme,
         });
+
+        // These callbacks belong to this launch, even if its socket later
+        // initializes another terminal after this one exits.
+        const launchedProcess = shellProcess;
+        const launchedSessionKey = ptySessionKey;
 
         shellProcess.onData((chunk) => {
           if (!ptySessionKey) {
             return;
           }
 
-          const session = ptySessionsMap.get(ptySessionKey);
-          if (!session) {
+          const session = ptySessionsMap.get(launchedSessionKey);
+          if (!session || session.pty !== launchedProcess) {
             return;
           }
 
@@ -756,8 +813,8 @@ export function handleShellConnection(
             return;
           }
 
-          const session = ptySessionsMap.get(ptySessionKey);
-          if (session && session.pty !== shellProcess) {
+          const session = ptySessionsMap.get(launchedSessionKey);
+          if (!session || session.pty !== launchedProcess) {
             return;
           }
 
@@ -770,14 +827,15 @@ export function handleShellConnection(
                 }\x1b[0m\r\n`,
               })
             );
+            if (session.provider === 'codex') session.ws.send(JSON.stringify({ type: 'session_exited' }));
           }
 
           if (session?.timeoutId) {
             clearTimeout(session.timeoutId);
           }
 
-          ptySessionsMap.delete(ptySessionKey);
-          shellProcess = null;
+          ptySessionsMap.delete(launchedSessionKey);
+          if (shellProcess === launchedProcess) shellProcess = null;
         });
 
         let welcomeMsg = `\x1b[36mStarting terminal in: ${projectPath}\x1b[0m\r\n`;
@@ -802,6 +860,24 @@ export function handleShellConnection(
           })
         );
         sendClaudeColorScheme(ws, claudeColorScheme);
+        return;
+      }
+
+      // A replacement socket takes control. Old sockets may still deliver
+      // queued frames; none of them may operate on the retained process.
+      const ownedSession = ptySessionKey ? ptySessionsMap.get(ptySessionKey) : null;
+      if (!ownedSession || ownedSession.ws !== ws || ownedSession.pty !== shellProcess || ownedSession.terminating) {
+        return;
+      }
+
+      if (data.type === 'terminate' && ownedSession.provider === 'codex') {
+        ownedSession.terminating = true;
+        try {
+          ownedSession.pty.kill();
+        } catch (error) {
+          ownedSession.terminating = false;
+          throw error;
+        }
         return;
       }
 
@@ -858,8 +934,10 @@ export function handleShellConnection(
         return;
       }
 
+      session.timeoutId = null;
+      session.terminating = true;
       session.pty.kill();
-      ptySessionsMap.delete(ptySessionKey as string);
+      if (session.provider !== 'codex') ptySessionsMap.delete(ptySessionKey as string);
     }, PTY_SESSION_TIMEOUT);
   });
 

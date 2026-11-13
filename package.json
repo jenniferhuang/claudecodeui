@@ -53,6 +53,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p server/tsconfig.json",
     "test": "tsx --tsconfig server/tsconfig.json --test \"server/**/*.test.ts\" \"server/**/*.test.js\"",
     "test:client": "vitest run",
+    "test:codex-handoff": "node scripts/verify-codex-shell-handoff.mjs",
     "lint": "oxlint src/ server/",
     "lint:server": "oxlint server/",
     "lint:client": "oxlint src/",

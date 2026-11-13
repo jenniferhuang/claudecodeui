@@ -207,6 +207,8 @@
     },
     "actions": {
       "disconnect": "断开连接",
+      "endCodex": "结束 Codex Shell",
+      "endCodexTitle": "结束此 Codex 终端并将会话交还给 Chat；此终端中正在执行的任务也会停止。",
       "disconnectTitle": "断开 Shell 连接",
       "restart": "重启",
       "restartTitle": "重启 Shell（请先断开连接）",

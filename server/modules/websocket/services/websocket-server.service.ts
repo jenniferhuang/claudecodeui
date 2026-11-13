@@ -2,7 +2,8 @@ import type { Server as HttpServer } from 'node:http';
 
 import { WebSocket, WebSocketServer, type VerifyClientCallbackSync } from 'ws';
 
-import { handleChatConnection } from '@/modules/websocket/services/chat-websocket.service.js';
+import { sessionsDb } from '@/modules/database/index.js';
+import { handleChatConnection, isCodexChatSessionActive } from '@/modules/websocket/services/chat-websocket.service.js';
 import { verifyWebSocketClient } from '@/modules/websocket/services/websocket-auth.service.js';
 import { handlePluginWsProxy } from '@/modules/websocket/services/plugin-websocket-proxy.service.js';
 import { handleShellConnection } from '@/modules/websocket/services/shell-websocket.service.js';
@@ -99,7 +100,22 @@ export function createWebSocketServer(
     const pathname = new URL(url, 'http://localhost').pathname;
 
     if (pathname === '/shell') {
-      handleShellConnection(ws, dependencies.shell);
+      handleShellConnection(ws, {
+        ...dependencies.shell,
+        isChatSessionRunning: (sessionId, providerSessionId) => {
+          // Resolve native-id clients back to the app id used by the runtime.
+          const ids = new Set([sessionId]);
+          if (providerSessionId) ids.add(providerSessionId);
+          for (const id of Array.from(ids)) {
+            const session = sessionsDb.getSessionByProviderSessionId(id);
+            if (session?.provider === 'codex') ids.add(session.session_id);
+          }
+          return Array.from(ids).some((id) => (
+            isCodexChatSessionActive(id) ||
+            dependencies.chat.runtime.hasBackgroundWork(id)
+          ));
+        },
+      });
       return;
     }
 

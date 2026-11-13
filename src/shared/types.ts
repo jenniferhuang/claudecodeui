@@ -279,6 +279,16 @@ export type ServerEvent = {
 
 // ---------------------------
 
+//----------------- SHELL CONNECTION LIFECYCLE ------------
+
+/** Options passed through the Shell runtime to its connection hook; only an explicit Restart may replace a retained non-Codex terminal. */
+export type ShellConnectOptions = { forceRestart?: boolean };
+
+/** Controls user-requested detachment. `terminate` explicitly ends the current Codex PTY; ordinary disconnects preserve it for reconnection. */
+export type ShellDisconnectOptions = { suppressAutoConnect?: boolean; terminate?: boolean };
+
+// ---------------------------
+
 //----------------- SHARED UI PRIMITIVES ------------
 
 /** Progress state of a single queue row, driving the indicator the Queue primitive renders. */
