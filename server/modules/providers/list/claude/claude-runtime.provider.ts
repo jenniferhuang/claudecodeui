@@ -23,13 +23,16 @@ import type { ElicitationRequest, ElicitationResult, SDKUserMessage } from '@ant
 import {
   appendFilesInputTag,
   buildClaudeUserContent,
-  normalizeImageDescriptors
-} from '@/shared/image-attachments.js';
+  normalizeImageDescriptors,
+  resolveClaudeCodeExecutablePath,
+  createCompleteMessage,
+  createNormalizedMessage,
+  errorMessage,
+} from '@/shared/index.js';
 import {
   CLAUDE_PREDEFINED_MODELS,
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
-import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
 import { askClaudeSideQuestion } from '@/modules/providers/list/claude/claude-side-question.provider.js';
 import {
   createNotificationEvent,
@@ -43,7 +46,6 @@ import {
   getReportedClaudeContextWindow,
   rememberClaudeContextWindow
 } from '@/modules/providers/services/provider-token-usage.service.js';
-import { createCompleteMessage, createNormalizedMessage, errorMessage } from '@/shared/utils.js';
 import type {
   AnyRecord,
   BackgroundTaskSummary,
@@ -53,7 +55,7 @@ import type {
   SideQuestionRequest,
   SideQuestionSink,
   SideQuestionOutcome,
-} from '@/shared/types.js';
+} from '@/shared/index.js';
 
 // The notifications module is still JavaScript, and its defaults (`dedupeKey = null`)
 // infer as the only accepted types; this states the shape callers really pass.
@@ -381,6 +383,12 @@ function mapCliOptionsToSDK(options: AnyRecord = {}) {
   const { providerSessionId, cwd, toolsSettings, permissionMode, effort, resumeAnchorId, resumeFromScratch } = options;
 
   const sdkOptions: AnyRecord = {};
+
+  if (process.env.CLOUDCLI_PROCESS_SANDBOX === '1') {
+    // The inherited server policy still confines tool writes, including in
+    // bypass mode; disabling a second sandbox avoids macOS sandbox_init errors.
+    sdkOptions.sandbox = { enabled: false };
+  }
 
   sdkOptions.env = buildClaudeSdkEnv();
 

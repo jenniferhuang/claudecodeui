@@ -179,12 +179,64 @@ export function errorMessage(error: unknown): string {
 // ---------------------------
 //----------------- WORKSPACE PATH VALIDATION UTILITIES ------------
 /**
- * Root directory that all workspace/project paths must stay under.
+ * Primary directory used by the File Tree picker and Projects defaults.
  *
  * This is resolved from `WORKSPACES_ROOT` when configured; otherwise it falls
- * back to the current user's home directory.
+ * back to the policy's first writable root, then the user's home directory.
+ * Additional writable locations are provided by WORKSPACE_ROOTS.
  */
-export const WORKSPACES_ROOT = process.env.WORKSPACES_ROOT || os.homedir();
+export const WORKSPACES_ROOT = process.env.WORKSPACES_ROOT
+  || readOptionalDirectoryRoots('CLOUDCLI_WRITE_ROOTS')?.[0]
+  || os.homedir();
+
+/**
+ * Writable roots consumed by the File Tree composition root and the Projects
+ * validator. A server-owned policy takes precedence over the folder-picker
+ * settings; without a policy, WORKSPACES_ALLOWED_ROOTS extends the primary
+ * WORKSPACES_ROOT. Each configured value must be an absolute path.
+ */
+export const WORKSPACE_ROOTS = [...new Set(
+  readOptionalDirectoryRoots('CLOUDCLI_WRITE_ROOTS')
+  ?? [WORKSPACES_ROOT, ...(readOptionalDirectoryRoots('WORKSPACES_ALLOWED_ROOTS') ?? [])],
+)];
+
+function readOptionalDirectoryRoots(environmentKey: string): string[] | undefined {
+  const configured = process.env[environmentKey];
+  if (configured === undefined) return undefined;
+  let roots: unknown;
+  try { roots = JSON.parse(configured); } catch {
+    throw new Error(`${environmentKey} must be a JSON array of absolute directory paths`);
+  }
+  if (!Array.isArray(roots) || roots.some((root) => typeof root !== 'string' || !path.isAbsolute(root))
+    || (environmentKey === 'CLOUDCLI_WRITE_ROOTS' && roots.length === 0)) {
+    throw new Error(`${environmentKey} must be a JSON array of absolute directory paths`);
+  }
+  return roots;
+}
+
+function isPathWithinRoot(candidatePath: string, root: string): boolean {
+  const relative = path.relative(root, candidatePath);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+async function resolvePathThroughExistingAncestor(candidatePath: string): Promise<string> {
+  try {
+    return normalizeProjectPath(await realpath(candidatePath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    try {
+      if ((await lstat(candidatePath)).isSymbolicLink()) {
+        const target = await readlink(candidatePath);
+        return resolvePathThroughExistingAncestor(path.resolve(path.dirname(candidatePath), target));
+      }
+    } catch (entryError) {
+      if ((entryError as NodeJS.ErrnoException).code !== 'ENOENT') throw entryError;
+    }
+    const parentPath = path.dirname(candidatePath);
+    if (parentPath === candidatePath) throw error;
+    return normalizeProjectPath(path.join(await resolvePathThroughExistingAncestor(parentPath), path.basename(candidatePath)));
+  }
+}
 
 /**
  * System-critical paths that must never be used as workspace roots.
@@ -280,7 +332,7 @@ export async function resolvePathUnderRoots(targetPath: string, roots: string[])
       continue;
     }
 
-    if (resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+    if (isPathWithinRoot(resolvedPath, resolvedRoot)) {
       return resolvedPath;
     }
   }
@@ -293,7 +345,7 @@ export async function resolvePathUnderRoots(targetPath: string, roots: string[])
  * or `null` when it does not.
  */
 export function resolveReadOnlyRootPath(targetPath: string): Promise<string | null> {
-  return resolvePathUnderRoots(targetPath, READ_ONLY_ROOTS);
+  return resolvePathUnderRoots(targetPath, readOptionalDirectoryRoots('CLOUDCLI_READ_ROOTS') ?? READ_ONLY_ROOTS);
 }
 
 function stripWindowsLongPathPrefix(inputPath: string): string {
@@ -357,9 +409,10 @@ export function normalizeProjectPath(inputPath: string): string {
 /**
  * Validates that a user-supplied workspace path is safe to use.
  *
- * Call this before any filesystem mutation that creates or registers projects.
- * The function resolves symlinks, enforces `WORKSPACES_ROOT` containment, and
- * blocks known system directories.
+ * Projects and File Tree use this before workspace creation and managed editor
+ * mutations. It resolves existing symlinks and missing descendants, enforces
+ * containment in WORKSPACE_ROOTS, and blocks known system directories. Review
+ * access is deliberately handled separately by resolveReadOnlyRootPath.
  */
 export async function validateWorkspacePath(requestedPath: string): Promise<WorkspacePathValidationResult> {
   try {
@@ -402,36 +455,15 @@ export async function validateWorkspacePath(requestedPath: string): Promise<Work
       }
     }
 
-    let resolvedPath = normalizeProjectPath(absolutePath);
-    try {
-      await access(absolutePath);
-      resolvedPath = normalizeProjectPath(await realpath(absolutePath));
-    } catch (error) {
-      const fileError = error as NodeJS.ErrnoException;
-      if (fileError.code !== 'ENOENT') {
-        throw fileError;
-      }
-
-      const parentPath = path.dirname(absolutePath);
-      try {
-        const parentRealPath = await realpath(parentPath);
-        resolvedPath = normalizeProjectPath(path.join(parentRealPath, path.basename(absolutePath)));
-      } catch (parentError) {
-        const parentFileError = parentError as NodeJS.ErrnoException;
-        if (parentFileError.code !== 'ENOENT') {
-          throw parentFileError;
-        }
-      }
-    }
-
-    const resolvedWorkspaceRoot = normalizeProjectPath(await realpath(WORKSPACES_ROOT));
-    if (
-      !resolvedPath.startsWith(`${resolvedWorkspaceRoot}${path.sep}`)
-      && resolvedPath !== resolvedWorkspaceRoot
-    ) {
+    const resolvedPath = await resolvePathThroughExistingAncestor(absolutePath);
+    const resolvedWorkspaceRoots = await Promise.all(WORKSPACE_ROOTS.map(async (root) => {
+      try { return normalizeProjectPath(await realpath(root)); } catch { return null; }
+    }));
+    const resolvedWorkspaceRoot = resolvedWorkspaceRoots.find((root) => root !== null && isPathWithinRoot(resolvedPath, root));
+    if (!resolvedWorkspaceRoot) {
       return {
         valid: false,
-        error: `Workspace path must be within the allowed workspace root: ${WORKSPACES_ROOT}`,
+        error: `Workspace path must be within the allowed workspace roots: ${WORKSPACE_ROOTS.join(', ')}`,
       };
     }
 
@@ -443,8 +475,7 @@ export async function validateWorkspacePath(requestedPath: string): Promise<Work
         const resolvedSymlinkPath = path.resolve(path.dirname(absolutePath), symlinkTarget);
         const realSymlinkPath = await realpath(resolvedSymlinkPath);
         if (
-          !realSymlinkPath.startsWith(`${resolvedWorkspaceRoot}${path.sep}`)
-          && realSymlinkPath !== resolvedWorkspaceRoot
+          !isPathWithinRoot(realSymlinkPath, resolvedWorkspaceRoot)
         ) {
           return {
             valid: false,

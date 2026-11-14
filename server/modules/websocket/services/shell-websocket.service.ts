@@ -5,7 +5,7 @@ import path from 'node:path';
 import pty, { type IPty } from 'node-pty';
 import { WebSocket, type RawData } from 'ws';
 
-import { parseIncomingJsonObject, stripAnsiSequences } from '@/shared/utils.js';
+import { parseIncomingJsonObject, stripAnsiSequences } from '@/shared/index.js';
 
 import { hasOpenCodexThreadLock, inspectOwnedCodexShellThread } from './codex-shell-identity.service.js';
 
@@ -285,7 +285,8 @@ function buildShellCommand(
     // Own the runtime instead of subscribing to a shared daemon that can keep
     // the writer after this PTY exits. A failed resume must not start a new history.
     const executable = os.platform() === 'win32' ? 'codex' : 'exec codex';
-    return otherProgram(`${executable} --no-daemon${resumeSessionId ? ` resume "${resumeSessionId}"` : ''}`);
+    const sandboxFlag = process.env.CLOUDCLI_PROCESS_SANDBOX === '1' ? ' --sandbox danger-full-access' : '';
+    return otherProgram(`${executable} --no-daemon${sandboxFlag}${resumeSessionId ? ` resume "${resumeSessionId}"` : ''}`);
   }
 
   if (provider === 'opencode') {
@@ -302,7 +303,12 @@ function buildShellCommand(
     ? ' --dangerously-skip-permissions'
     : '';
   const theme = buildClaudeThemeLaunch(readColorScheme(message.colorScheme), projectPath);
-  const launchFlags = `${bypassFlag}${theme.flag}`;
+  // Theme files below include this setting when they supply --settings. Avoid
+  // passing a second --settings flag that could replace the selected theme.
+  const sandboxFlag = process.env.CLOUDCLI_PROCESS_SANDBOX === '1' && !theme.flag
+    ? ` --settings '{"sandbox":{"enabled":false}}'`
+    : '';
+  const launchFlags = `${bypassFlag}${theme.flag}${sandboxFlag}`;
   if (resumeSessionId) {
     const command = os.platform() === 'win32'
       ? `claude --resume "${resumeSessionId}"${launchFlags}; if ($LASTEXITCODE -ne 0) { claude${launchFlags} }`
@@ -421,7 +427,8 @@ function resolveClaudeTheme(projectPath: string): string {
 let hasLoggedThemeSettingsFileError = false;
 
 /**
- * Returns a settings file that holds only `{"theme": theme}`, writing it when
+ * Returns a settings file for the launch theme and, when configured, inherited
+ * process-sandbox compatibility. Writes it only when
  * it is missing or differs. It lives in the app's own data folder
  * (`~/.cloudcli`, like the chat assets); the user's Claude config is never
  * written. The write goes through a temp file and a rename, so a CLI starting
@@ -430,7 +437,10 @@ let hasLoggedThemeSettingsFileError = false;
  * goes ahead without a theme.
  */
 function ensureClaudeThemeSettingsFile(theme: string): string | null {
-  const contents = `${JSON.stringify({ theme })}\n`;
+  const contents = `${JSON.stringify({
+    theme,
+    ...(process.env.CLOUDCLI_PROCESS_SANDBOX === '1' ? { sandbox: { enabled: false } } : {}),
+  })}\n`;
   let tempPath: string | null = null;
   try {
     const filePath = path.join(os.homedir(), '.cloudcli', `claude-shell-theme-${theme}.json`);

@@ -1,6 +1,6 @@
 {
   "name": "@cloudcli-ai/cloudcli",
-  "version": "1.37.8-jh.1",
+  "version": "1.37.8-jh.2",
   "productName": "CloudCLI",
   "desktopName": "ai.cloudcli.desktop.desktop",
   "description": "A web-based UI for Claude Code CLI",
@@ -17,7 +17,8 @@
     "dist/",
     "dist-server/",
     "scripts/",
-    "README.md"
+    "README.md",
+    "docs/filesystem-permissions.md"
   ],
   "homepage": "https://cloudcli.ai",
   "repository": {

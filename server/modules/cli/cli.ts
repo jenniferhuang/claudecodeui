@@ -1,13 +1,20 @@
 #!/usr/bin/env node
 
-// The CLI can reach shared environment constants through its composition root,
-// so finish the root environment bootstrap before loading that import graph.
-// eslint-disable-next-line boundaries/no-unknown
-import '../../load-env.js';
+import { parseCliArguments } from './cli-arguments.service.js';
 
 async function runCli(): Promise<number> {
+  const argumentsList = process.argv.slice(2);
+  const { options } = parseCliArguments(argumentsList);
+  if (options.databasePath) process.env.DATABASE_PATH = options.databasePath;
+  if (options.serverPort) process.env.SERVER_PORT = options.serverPort;
+
+  // The filesystem policy must grant the selected database, not a default
+  // subsequently replaced by CLI flags. Keep all environment-dependent imports
+  // behind this pure argument pass, then initialize .env and the OS boundary.
+  // eslint-disable-next-line boundaries/no-unknown
+  await import('../../load-env.js');
   const { createCliApplication } = await import('./index.js');
-  return createCliApplication().run(process.argv.slice(2));
+  return createCliApplication().run(argumentsList);
 }
 
 runCli().then((exitCode) => {

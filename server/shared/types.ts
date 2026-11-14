@@ -1577,7 +1577,15 @@ export type FileTreeProjectGateway = {
  */
 export type FileTreeWorkspaceGateway = {
   rootPath: string;
+  /** Additional writable roots shown as shortcuts in the default folder picker. */
+  allowedRoots?: string[];
   validatePath(candidatePath: string): Promise<WorkspacePathValidationResult>;
+  /**
+   * Optional server-owned write validator for every editor mutation, including
+   * projects indexed before the policy was installed. Omit only when no managed
+   * filesystem policy is configured so legacy project editing stays unchanged.
+   */
+  validateWritePath?(candidatePath: string): Promise<WorkspacePathValidationResult>;
   /**
    * Resolves a path readable outside the workspace root — the system temp
    * directory and the Claude projects directory — or `null` when it is not

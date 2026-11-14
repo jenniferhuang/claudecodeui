@@ -24,18 +24,53 @@ function sourceModuleUrl(...segments: string[]): string {
   return pathToFileURL(path.join(applicationRoot, ...segments)).href;
 }
 
-async function runCliBootstrapFixture(isPlatform: boolean): Promise<BootstrapResult> {
+async function runCliBootstrapFixture(
+  isPlatform: boolean,
+  cliOptions: { databaseFlag?: '--database-path' | '--database-path='; portFlag?: '--port' | '--port=' | '-p' } = {},
+): Promise<BootstrapResult> {
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'cloudcli-cli-bootstrap-'));
   const fixtureServerDirectory = path.join(fixtureRoot, 'server');
   const fixtureCliDirectory = path.join(fixtureServerDirectory, 'modules', 'cli');
+  const fixturePolicyDirectory = path.join(fixtureServerDirectory, 'modules', 'filesystem-policy');
   const fixtureDatabasePath = path.join(fixtureRoot, 'auth.db');
+  const selectedDatabasePath = cliOptions.databaseFlag ? path.join(fixtureRoot, 'custom auth.db') : fixtureDatabasePath;
+  const selectedPort = cliOptions.portFlag ? '4183' : '3101';
+  const commandArguments = ['status'];
+  if (cliOptions.databaseFlag === '--database-path') commandArguments.push('--database-path', selectedDatabasePath);
+  if (cliOptions.databaseFlag === '--database-path=') commandArguments.push('--database-path=' + selectedDatabasePath);
+  if (cliOptions.portFlag === '--port=') commandArguments.push('--port=' + selectedPort);
+  else if (cliOptions.portFlag) commandArguments.push(cliOptions.portFlag, selectedPort);
 
   try {
+    await writeFile(path.join(fixtureRoot, 'package.json'), '{"type":"module"}\n', 'utf8');
     await mkdir(fixtureCliDirectory, { recursive: true });
+    await mkdir(fixturePolicyDirectory, { recursive: true });
+    // These fixtures exercise .env/auth initialization, independently of the
+    // operator's real optional filesystem policy. The policy module has its
+    // own bootstrap and native sandbox tests with isolated home directories.
+    await writeFile(
+      path.join(fixturePolicyDirectory, 'index.ts'),
+      `export async function initializeFilesystemPolicy(): Promise<void> {
+        if (process.env.CLOUDCLI_FILESYSTEM_POLICY !== ${JSON.stringify(path.join(fixtureRoot, 'policy.json'))}
+          || process.env.DATABASE_PATH !== ${JSON.stringify(selectedDatabasePath)}
+          || process.env.SERVER_PORT !== ${JSON.stringify(selectedPort)}) {
+          throw new Error('Deployment policy and database settings were not loaded before the policy bootstrap');
+        }
+        if (process.env.CLOUDCLI_PROCESS_SANDBOX || process.env.CLOUDCLI_SANDBOX_ACTIVE
+          || process.env.CLOUDCLI_SANDBOX_PROFILE || process.env.CLOUDCLI_WRITE_ROOTS || process.env.CLOUDCLI_READ_ROOTS) {
+          throw new Error('Package .env fabricated a filesystem sandbox marker');
+        }
+      }\n`,
+      'utf8',
+    );
     await Promise.all([
       copyFile(
         path.join(applicationRoot, 'server', 'load-env.ts'),
         path.join(fixtureServerDirectory, 'load-env.ts'),
+      ),
+      copyFile(
+        path.join(applicationRoot, 'server', 'modules', 'cli', 'cli-arguments.service.ts'),
+        path.join(fixtureCliDirectory, 'cli-arguments.service.ts'),
       ),
       copyFile(
         path.join(applicationRoot, 'server', 'modules', 'cli', 'cli.ts'),
@@ -47,6 +82,13 @@ async function runCliBootstrapFixture(isPlatform: boolean): Promise<BootstrapRes
       [
         `VITE_IS_PLATFORM=${String(isPlatform)}`,
         `DATABASE_PATH=${fixtureDatabasePath.replace(/\\/g, '/')}`,
+        'SERVER_PORT=3101',
+        `CLOUDCLI_FILESYSTEM_POLICY=${path.join(fixtureRoot, 'policy.json').replace(/\\/g, '/')}`,
+        'CLOUDCLI_PROCESS_SANDBOX=1',
+        'CLOUDCLI_SANDBOX_ACTIVE=1',
+        'CLOUDCLI_SANDBOX_PROFILE=/untrusted/profile.sb',
+        'CLOUDCLI_WRITE_ROOTS=["/"]',
+        'CLOUDCLI_READ_ROOTS=["/"]',
       ].join('\n'),
       'utf8',
     );
@@ -131,6 +173,11 @@ export function createCliApplication() {
     const childEnvironment = { ...process.env };
     delete childEnvironment.VITE_IS_PLATFORM;
     delete childEnvironment.DATABASE_PATH;
+    delete childEnvironment.SERVER_PORT;
+    delete childEnvironment.PORT;
+    for (const key of ['CLOUDCLI_FILESYSTEM_POLICY', 'CLOUDCLI_PROCESS_SANDBOX', 'CLOUDCLI_SANDBOX_ACTIVE', 'CLOUDCLI_SANDBOX_PROFILE', 'CLOUDCLI_WRITE_ROOTS', 'CLOUDCLI_READ_ROOTS']) {
+      delete childEnvironment[key];
+    }
     const stdout = execFileSync(
       process.execPath,
       [
@@ -138,7 +185,7 @@ export function createCliApplication() {
         '--tsconfig',
         path.join(applicationRoot, 'server', 'tsconfig.json'),
         path.join(fixtureCliDirectory, 'cli.ts'),
-        'status',
+        ...commandArguments,
       ],
       {
         cwd: applicationRoot,
@@ -184,3 +231,17 @@ test('CLI bootstrap selects OSS authentication and local runtime from .env', asy
     runtime: 'local',
   });
 });
+
+for (const cliOptions of [
+  { databaseFlag: '--database-path', portFlag: '-p' },
+  { databaseFlag: '--database-path=', portFlag: '--port=' },
+] as const) {
+  test(`CLI ${cliOptions.databaseFlag} overrides .env before filesystem-policy initialization`, async () => {
+    // The fixture policy throws unless it observes the custom database and
+    // port before shared environment constants and authentication are loaded.
+    const result = await runCliBootstrapFixture(false, cliOptions);
+    assert.equal(result.command, 'status');
+    assert.equal(result.authStatus, 401);
+    assert.equal(result.runtime, 'local');
+  });
+}

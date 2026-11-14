@@ -22,10 +22,10 @@ import {
   createNormalizedMessage,
 } from '@/shared/index.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
-import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
-// Not re-exported through the `@/shared/index.js` barrel yet (same seam the
-// Claude side-question provider already uses), so imported directly.
-import type { SideQuestionOutcome, SideQuestionRequest, SideQuestionSink } from '@/shared/types.js';
+import type {
+  AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter,
+  SideQuestionOutcome, SideQuestionRequest, SideQuestionSink,
+} from '@/shared/index.js';
 
 import { codexAppServer } from './codex-app-server.client.js';
 
@@ -233,6 +233,14 @@ function transformCodexEvent(event: AnyRecord): AnyRecord {
  * @returns {object} - { sandboxMode, approvalPolicy }
  */
 function mapPermissionModeToCodexOptions(permissionMode: string): Pick<ThreadOptions, 'sandboxMode' | 'approvalPolicy'> {
+  if (process.env.CLOUDCLI_PROCESS_SANDBOX === '1') {
+    // The server's inherited Seatbelt policy is the write boundary for every
+    // UI permission mode. macOS cannot install another sandbox inside it.
+    return {
+      sandboxMode: 'danger-full-access',
+      approvalPolicy: permissionMode === 'acceptEdits' || permissionMode === 'bypassPermissions' ? 'never' : 'on-request',
+    };
+  }
   switch (permissionMode) {
     case 'acceptEdits':
       return {

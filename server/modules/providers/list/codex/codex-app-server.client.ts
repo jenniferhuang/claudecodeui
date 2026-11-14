@@ -8,7 +8,7 @@ import {
   SIDE_CONVERSATION_BOUNDARY_PROMPT,
   SIDE_CONVERSATION_DEVELOPER_INSTRUCTIONS,
   SIDE_QUESTION_ANSWER_SEPARATOR,
-} from '@/shared/utils.js';
+} from '@/shared/index.js';
 
 /**
  * Minimal JSON-RPC client for `codex app-server`.
@@ -541,7 +541,10 @@ export const codexAppServer = {
             ...(input.cwd ? { cwd: input.cwd } : {}),
             ...(input.model ? { model: input.model } : {}),
             ephemeral: true,
-            sandbox: 'read-only',
+            // A configured server sandbox is already inherited by this fork;
+            // macOS rejects a nested sandbox_init. Read-only instructions and
+            // the external-tool exclusions below still apply to side questions.
+            sandbox: process.env.CLOUDCLI_PROCESS_SANDBOX === '1' ? 'danger-full-access' : 'read-only',
             approvalPolicy: 'never',
             developerInstructions: SIDE_CONVERSATION_DEVELOPER_INSTRUCTIONS,
             excludeTurns: true,
