@@ -8,6 +8,7 @@ on:
 
 jobs:
   build-linux:
+    if: github.repository == 'siteboon/claudecodeui'
     name: Build Linux desktop artifact
     # Pinned to the oldest supported runner on purpose: the .deb and the native
     # server bundle link against the builder's glibc, so building on a newer

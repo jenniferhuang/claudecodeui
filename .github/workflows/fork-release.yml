@@ -1,0 +1,69 @@
+name: Fork Tarball Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: 'Exact reviewed 40-character main commit SHA (version must already be committed)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-tarball-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.repository == 'jenniferhuang/claudecodeui' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout the dispatched main commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+      - name: Verify reviewed main commit and unused version
+        run: node scripts/release/fork-release.mjs preflight
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}
+
+  quality:
+    needs: preflight
+    uses: ./.github/workflows/fork-quality.yml
+    permissions:
+      contents: read
+
+  publish:
+    if: github.repository == 'jenniferhuang/claudecodeui' && github.ref == 'refs/heads/main'
+    needs: [preflight, quality]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the same tested main commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+      - name: Download only this run's tested assets
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: fork-npm-${{ github.sha }}-${{ github.run_attempt }}
+          path: release/fork
+      - name: Verify provenance, refuse collisions, and publish complete release
+        run: node scripts/release/fork-release.mjs publish
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}

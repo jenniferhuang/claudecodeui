@@ -1,0 +1,70 @@
+name: Fork Quality
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-quality-${{ github.event_name }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    if: github.repository == 'jenniferhuang/claudecodeui'
+    name: Quality (${{ matrix.os }}, Node 22)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    env:
+      CI: 'true'
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - name: Checkout the tested commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+        env:
+          # ripgrep postinstall fetches public GitHub release assets.
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Test fork release safeguards
+        run: node --test scripts/release/fork-release.test.mjs
+      - name: Backend tests
+        run: ./node_modules/.bin/tsx --tsconfig server/tsconfig.json --test --test-concurrency=4 "server/**/*.test.ts" "server/**/*.test.js"
+      - name: Frontend tests
+        run: npm run test:client -- --maxWorkers=2 --minWorkers=1
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Build frontend and backend
+        run: npm run build
+      - name: Create and verify npm tarball
+        run: node scripts/release/fork-release.mjs pack
+      - name: Install production tarball and smoke test CLI and SDK
+        run: node scripts/release/fork-release.mjs smoke
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Upload the tested Linux release assets
+        if: matrix.os == 'ubuntu-22.04'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fork-npm-${{ github.sha }}-${{ github.run_attempt }}
+          path: release/fork/*
+          if-no-files-found: error
+          retention-days: 14
