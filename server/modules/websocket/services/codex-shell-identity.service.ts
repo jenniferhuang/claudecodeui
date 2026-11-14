@@ -74,11 +74,12 @@ export async function inspectOwnedCodexShellThread(
 
 /**
  * Used by Shell admission and the refresh wrapper consumed by Chat/schedules.
- * Only an open regular descriptor for this exact canonical native lock is busy;
- * an absent file is clear, and unsupported/failed inspection remains unknown.
- * This never acquires the lock or infers ownership from an unrelated thread.
+ * Probe the native writer flock, not whether a process merely has the file open.
+ * The read-only helper releases a successfully acquired lock immediately; it
+ * never deletes the file or changes another process's ownership. Missing Perl
+ * or unsupported inspection leaves Codex's own writer check authoritative.
  */
-export async function hasOpenCodexThreadLock(
+export async function hasHeldCodexThreadLock(
   nativeId: string,
   codexHome: string,
   dependencies: IdentityDependencies = {},
@@ -87,31 +88,35 @@ export async function hasOpenCodexThreadLock(
   if (platform !== 'darwin' && platform !== 'linux') return undefined;
   if (!SAFE_NATIVE_ID.test(nativeId) || nativeId === '.' || nativeId === '..') return undefined;
   const runFile = dependencies.runFile ?? execFileAsync;
+  let lockPath: string;
   try {
-    const lockPath = await fs.realpath(path.join(codexHome, 'thread-writer-locks', `${nativeId}.lock`));
-    const before = await fs.stat(lockPath);
-    if (!before.isFile()) return undefined;
-    let stdout: string;
-    try {
-      ({ stdout } = await runFile(platform === 'darwin' ? '/usr/sbin/lsof' : 'lsof',
-        ['-nP', '-F', 'pftn', lockPath], { timeout: 1000, maxBuffer: 1024 * 1024 }));
-    } catch (error) {
-      const failure = error as { code?: unknown; stdout?: string; stderr?: string };
-      if (failure.code === 1 && !failure.stdout && !failure.stderr) return false;
-      return undefined;
-    }
-    const after = await fs.stat(lockPath);
-    if (before.dev !== after.dev || before.ino !== after.ino) return undefined;
-    let processFound = false;
-    let type = '';
-    for (const line of stdout.split('\n')) {
-      if (line.startsWith('p')) { processFound = /^p[0-9]+$/.test(line); type = ''; }
-      else if (line.startsWith('f')) type = '';
-      else if (line.startsWith('t')) type = line.slice(1);
-      else if (processFound && type === 'REG' && line === `n${lockPath}`) return true;
-    }
-    return stdout.trim() && !processFound ? undefined : false;
+    lockPath = await fs.realpath(path.join(codexHome, 'thread-writer-locks', `${nativeId}.lock`));
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? false : undefined;
+  }
+  try {
+    const before = await fs.stat(lockPath);
+    if (!before.isFile()) return undefined;
+    const { stdout } = await runFile(platform === 'darwin' ? '/usr/bin/perl' : 'perl', ['-e', `
+      use strict;
+      use warnings;
+      use Fcntl qw(O_RDONLY LOCK_EX LOCK_NB LOCK_UN);
+      use Errno qw(EAGAIN EWOULDBLOCK);
+      sysopen(my $lock, $ARGV[0], O_RDONLY) or die "open: $!";
+      if (flock($lock, LOCK_EX | LOCK_NB)) {
+        flock($lock, LOCK_UN) or die "unlock: $!";
+        print "clear\n";
+      } elsif ($! == EAGAIN || $! == EWOULDBLOCK) {
+        print "held\n";
+      } else {
+        die "flock: $!";
+      }
+    `, lockPath], { timeout: 1000, maxBuffer: 1024 * 1024 });
+    const after = await fs.stat(lockPath);
+    if (before.dev !== after.dev || before.ino !== after.ino) return undefined;
+    if (stdout.trim() === 'held') return true;
+    return stdout.trim() === 'clear' ? false : undefined;
+  } catch {
+    return undefined;
   }
 }

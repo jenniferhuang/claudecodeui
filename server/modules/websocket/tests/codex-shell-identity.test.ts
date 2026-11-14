@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, realpath, rm, symlink } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdtemp, mkdir, open, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { TestContext } from 'node:test';
 
-import { inspectOwnedCodexShellThread, hasOpenCodexThreadLock } from '@/modules/websocket/services/codex-shell-identity.service.js';
+import { inspectOwnedCodexShellThread, hasHeldCodexThreadLock } from '@/modules/websocket/services/codex-shell-identity.service.js';
 
 const pid = 43210;
 const firstIdentity = `${process.pid} ${pid} Sat Nov 14 12:00:00 2026`;
@@ -85,29 +87,77 @@ test('unsupported platforms and failed bounded inspection remain unassociated', 
 });
 
 
-test('the exact requested native writer FD stays busy until its descriptor closes', async (t) => {
+const perl = process.platform === 'darwin' ? '/usr/bin/perl' : 'perl';
+const nativeFlockAvailable = (process.platform === 'darwin' || process.platform === 'linux')
+  && spawnSync(perl, ['-MFcntl=:flock', '-e', 'exit 0'], { timeout: 1000 }).status === 0;
+const nativeFlockTest = { skip: nativeFlockAvailable ? false : 'Requires POSIX flock and Perl' };
+
+test('an open but unlocked native lock descriptor does not block a thread', nativeFlockTest, async (t) => {
   const f = await fixture(t);
-  const { writeFile } = await import('node:fs/promises');
-  await writeFile(path.join(f.lockDirectory, 'native-one.lock'), '');
-  let open = true;
-  const dependencies = { platform: 'darwin' as const,
-    runFile: async (_file: string, args: string[], options: { timeout: number }) => {
-      assert.equal(args.at(-1), path.join(f.lockDirectory, 'native-one.lock'));
-      assert.ok(options.timeout > 0 && options.timeout <= 1000);
-      return { stdout: open ? response(f.lockDirectory) : '' };
-    },
-  };
-  assert.equal(await hasOpenCodexThreadLock('native-one', f.home, dependencies), true);
-  open = false;
-  assert.equal(await hasOpenCodexThreadLock('native-one', f.home, dependencies), false);
+  const lock = await open(path.join(f.lockDirectory, 'native-one.lock'), 'w+');
+  t.after(() => lock.close());
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home), false);
+});
+
+test('a held native flock blocks only its thread and clears before its descriptor closes', nativeFlockTest, async (t) => {
+  const f = await fixture(t);
+  const lockPath = path.join(f.lockDirectory, 'native-one.lock');
+  await writeFile(lockPath, '');
+  await writeFile(path.join(f.lockDirectory, 'unrelated-native.lock'), '');
+  const child = spawn(perl, ['-e', `
+    use strict;
+    use warnings;
+    use Fcntl qw(O_RDONLY LOCK_EX LOCK_UN);
+    sysopen(my $lock, $ARGV[0], O_RDONLY) or die "open: $!";
+    flock($lock, LOCK_EX) or die "flock: $!";
+    $| = 1;
+    print "ready\n";
+    scalar <STDIN>;
+    flock($lock, LOCK_UN) or die "unlock: $!";
+    print "released\n";
+    scalar <STDIN>;
+  `, lockPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit');
+  t.after(async () => { child.stdin.end(); await exited; });
+  await once(child.stdout, 'data');
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home), true);
+  assert.equal(await hasHeldCodexThreadLock('unrelated-native', f.home), false);
+  const released = once(child.stdout, 'data');
+  child.stdin.write('release\n');
+  await released;
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home), false);
 });
 
 test('a missing requested lock is released; unsupported and failed probes stay unknown', async (t) => {
   const f = await fixture(t);
-  assert.equal(await hasOpenCodexThreadLock('missing-native', f.home, { platform: 'darwin' }), false);
+  assert.equal(await hasHeldCodexThreadLock('missing-native', f.home, { platform: 'darwin' }), false);
   const { writeFile } = await import('node:fs/promises');
   await writeFile(path.join(f.lockDirectory, 'native-one.lock'), '');
-  assert.equal(await hasOpenCodexThreadLock('native-one', f.home, { platform: 'win32' }), undefined);
-  assert.equal(await hasOpenCodexThreadLock('native-one', f.home, { platform: 'darwin',
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home, { platform: 'win32' }), undefined);
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home, { platform: 'darwin',
     runFile: async () => { throw new Error('lsof unavailable'); } }), undefined);
+});
+
+
+test('a missing flock helper and malformed output leave native Codex authoritative', async (t) => {
+  const f = await fixture(t);
+  await writeFile(path.join(f.lockDirectory, 'native-one.lock'), '');
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home, { platform: 'darwin',
+    runFile: async () => { throw Object.assign(new Error('missing helper'), { code: 'ENOENT', syscall: 'spawn /usr/bin/perl' }); } }), undefined);
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home, { platform: 'linux',
+    runFile: async () => ({ stdout: 'unrecognized result' }) }), undefined);
+});
+
+test('a replaced native lock inode cannot report ownership of the old file', async (t) => {
+  const f = await fixture(t);
+  const lockPath = path.join(f.lockDirectory, 'native-one.lock');
+  await writeFile(lockPath, '');
+  const original = await open(lockPath, 'r');
+  t.after(() => original.close());
+  assert.equal(await hasHeldCodexThreadLock('native-one', f.home, { platform: 'darwin',
+    runFile: async () => {
+      await rm(lockPath);
+      await writeFile(lockPath, '');
+      return { stdout: 'held\n' };
+    } }), undefined);
 });

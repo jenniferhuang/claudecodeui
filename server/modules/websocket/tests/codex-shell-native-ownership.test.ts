@@ -12,6 +12,9 @@ import { handleShellConnection, hasActiveCodexShellSession } from '@/modules/web
 const nativeProbeAvailable = (process.platform === 'darwin' || process.platform === 'linux')
   && spawnSync(process.platform === 'darwin' ? '/usr/sbin/lsof' : 'lsof', ['-v'], { stdio: 'ignore', timeout: 1000 }).status === 0;
 const nativeProbeTest = { skip: nativeProbeAvailable ? false : 'Requires POSIX process-group inspection and lsof' };
+const perl = process.platform === 'darwin' ? '/usr/bin/perl' : 'perl';
+const nativeWriterProbeTest = { skip: !['darwin', 'linux'].includes(process.platform)
+  || spawnSync(perl, ['-MFcntl=:flock', '-e', 'exit 0'], { timeout: 1000 }).status !== 0 };
 
 function socket() {
   return Object.assign(new EventEmitter(), {
@@ -122,25 +125,29 @@ test('a socket closed during native discovery never spawns a terminal later', na
 });
 
 
-test('a residual native writer FD blocks only its thread until the child closes it', nativeProbeTest, async (t) => {
+test('a held native writer blocks only its thread until its flock releases', nativeWriterProbeTest, async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'codex-residual-fd-'));
   const codexHome = path.join(directory, 'home');
   await mkdir(path.join(codexHome, 'thread-writer-locks'), { recursive: true });
   const nativeId = '01a1d85a-26f6-7131-930a-a5c3ecd144b9';
   const previousCodexHome = process.env.CODEX_HOME;
   process.env.CODEX_HOME = codexHome;
-  const child = spawn(process.execPath, ['-e', `
-    const fs = require('node:fs');
-    const fd = fs.openSync(process.argv[1], 'w');
-    process.stdout.write('ready');
-    process.stdin.once('data', () => { fs.closeSync(fd); process.stdout.write('closed'); });
-    setInterval(() => {}, 1000);
+  const child = spawn(perl, ['-e', `
+    use Fcntl qw(O_RDWR O_CREAT LOCK_EX LOCK_UN);
+    sysopen(my $lock, $ARGV[0], O_RDWR | O_CREAT, 0600) or die "open: $!";
+    flock($lock, LOCK_EX) or die "flock: $!";
+    $| = 1; print "ready\n";
+    scalar <STDIN>;
+    flock($lock, LOCK_UN) or die "unlock: $!";
+    print "released\n";
+    scalar <STDIN>;
   `, path.join(codexHome, 'thread-writer-locks', nativeId + '.lock')], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit');
   const exits: Array<() => void> = [];
   let launches = 0;
   t.after(async () => {
     exits.forEach((exit) => exit());
-    const exited = once(child, 'exit'); child.kill(); await exited;
+    child.stdin!.end(); await exited;
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
     await rm(directory, { recursive: true, force: true });
@@ -160,12 +167,12 @@ test('a residual native writer FD blocks only its thread until the child closes 
     sessionId: id, hasSession: true, attachOnly: false });
   target.emit('message', init(nativeId));
   await settle();
-  assert.equal(launches, 0, 'Chat completion or abort does not prove its native writer descriptor closed');
+  assert.equal(launches, 0, 'Chat completion or abort does not prove its native writer flock released');
   assert.ok(target.frames.some((frame) => frame.code === 'CHAT_SESSION_ACTIVE' && frame.retryable === true));
   unrelated.emit('message', init('other-native-history'));
-  assert.equal(launches, 1, 'an open target descriptor must not reserve unrelated histories');
-  const closed = once(child.stdout!, 'data'); child.stdin!.write('close'); await closed;
+  assert.equal(launches, 1, 'a held target writer must not reserve unrelated histories');
+  const released = once(child.stdout!, 'data'); child.stdin!.write('release\n'); await released;
   target.emit('message', init(nativeId));
   await settle();
-  assert.equal(launches, 2, 'the same live child process stops blocking once its exact descriptor closes');
+  assert.equal(launches, 2, 'the same live child stops blocking after flock release while its descriptor remains open');
 });

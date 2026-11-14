@@ -291,7 +291,7 @@ async function dispatchRun(
     // global Codex lock. Recheck synchronously after the discovery await.
     const ownership = await refreshCodexShellSessionOwnership(sessionId, session.provider_session_id);
     if (ownership === 'writer-held') {
-      const error = 'Codex is still releasing this thread. Retry after its writer exits.';
+      const error = "Another Codex process holds this thread's writer lock, even if its last turn has finished. Release the thread in the owning app or exit that Codex session, then retry.";
       if (ws) sendProtocolError(ws, 'RUN_IN_PROGRESS', error, sessionId);
       return { started: false, error, retryable: true };
     }
