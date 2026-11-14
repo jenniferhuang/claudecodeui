@@ -19,9 +19,17 @@ detached or terminating Shell and a Chat process finishing cleanup. Other
 sessions, project paths, and providers keep running. Switching tabs alone never
 stops an agent.
 
-New Codex terminals use `codex --no-daemon` (supported by the bundled 0.166.0
-CLI), so their lifetime does not extend into the shared background daemon.
+New Codex terminals use `codex --no-daemon`, so their lifetime does not extend
+into the shared background daemon.
 A failed `resume` reports its error instead of silently starting a new thread.
+
+## Changing threads inside a retained terminal
+
+CloudCLI associates a connected Shell with the native thread it launched or
+first discovered. Running `/new` or `/resume` inside that terminal does not
+retarget the conversation selected in CloudCLI. To change threads, end that
+Codex Shell, select the intended session in the sidebar, then click **Connect**.
+Native writer checks still protect the new thread from a second writer.
 
 ## Deployment considerations
 
