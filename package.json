@@ -17,7 +17,8 @@
     "dist/",
     "dist-server/",
     "scripts/",
-    "README.md"
+    "README.md",
+    "docs/filesystem-permissions.md"
   ],
   "homepage": "https://cloudcli.ai",
   "repository": {

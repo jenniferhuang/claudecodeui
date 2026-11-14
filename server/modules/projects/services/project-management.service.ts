@@ -6,8 +6,8 @@ import type {
   CreateProjectPathResult,
   ProjectRepositoryRow,
   WorkspacePathValidationResult,
-} from '@/shared/types.js';
-import { AppError, normalizeProjectPath, validateWorkspacePath } from '@/shared/utils.js';
+} from '@/shared/index.js';
+import { AppError, normalizeProjectPath, resolveReadOnlyRootPath, validateWorkspacePath } from '@/shared/index.js';
 
 type CreateProjectInput = {
   projectPath: string;
@@ -16,6 +16,7 @@ type CreateProjectInput = {
 
 type CreateProjectDependencies = {
   validatePath: (projectPath: string) => Promise<WorkspacePathValidationResult>;
+  resolveReviewProjectPath?: (projectPath: string) => Promise<string | null>;
   ensureWorkspaceDirectory: (projectPath: string) => Promise<void>;
   persistProjectPath: (projectPath: string, customName: string | null) => CreateProjectPathResult;
   getProjectByPath: (projectPath: string) => ProjectRepositoryRow | null;
@@ -43,6 +44,12 @@ type CreateProjectServiceResult = {
 
 const defaultDependencies: CreateProjectDependencies = {
   validatePath: validateWorkspacePath,
+  resolveReviewProjectPath: async (projectPath: string): Promise<string | null> => {
+    if (process.env.CLOUDCLI_READ_ROOTS === undefined) return null;
+    const readablePath = await resolveReadOnlyRootPath(projectPath);
+    if (!readablePath) return null;
+    return (await fs.stat(readablePath)).isDirectory() ? readablePath : null;
+  },
   ensureWorkspaceDirectory: async (projectPath: string): Promise<void> => {
     await fs.mkdir(projectPath, { recursive: true });
     const directoryStats = await fs.stat(projectPath);
@@ -85,6 +92,11 @@ function mapProjectRowToApiView(projectRow: ProjectRepositoryRow): ProjectApiVie
   };
 }
 
+/**
+ * Registers Projects routes and Worktrees workflows' project paths. Writable
+ * projects may be created; a managed review path must already be a readable
+ * directory and is registered without any directory mutation.
+ */
 export async function createProject(
   input: CreateProjectInput,
   dependencies: CreateProjectDependencies = defaultDependencies,
@@ -97,7 +109,15 @@ export async function createProject(
     });
   }
 
-  const pathValidation = await dependencies.validatePath(normalizedPath);
+  let pathValidation = await dependencies.validatePath(normalizedPath);
+  let isReviewProject = false;
+  if (!pathValidation.valid) {
+    const reviewPath = await dependencies.resolveReviewProjectPath?.(normalizedPath);
+    if (reviewPath) {
+      pathValidation = { valid: true, resolvedPath: reviewPath };
+      isReviewProject = true;
+    }
+  }
   if (!pathValidation.valid || !pathValidation.resolvedPath) {
     throw new AppError('Invalid project path', {
       code: 'INVALID_PROJECT_PATH',
@@ -107,7 +127,7 @@ export async function createProject(
   }
 
   const resolvedProjectPath = normalizeProjectPath(pathValidation.resolvedPath);
-  await dependencies.ensureWorkspaceDirectory(resolvedProjectPath);
+  if (!isReviewProject) await dependencies.ensureWorkspaceDirectory(resolvedProjectPath);
 
   const normalizedCustomName = resolveDisplayName(input.customName ?? null, resolvedProjectPath);
   const persistedProject = dependencies.persistProjectPath(resolvedProjectPath, normalizedCustomName);

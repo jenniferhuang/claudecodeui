@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createProject } from '@/modules/projects/services/project-management.service.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError } from '@/shared/index.js';
 
 const projectRow = {
   project_id: 'project-1',
@@ -11,6 +11,29 @@ const projectRow = {
   isStarred: 0,
   isArchived: 0,
 };
+
+test('registering a readable review directory never creates or changes its folder', async () => {
+  let ensuredDirectory = false;
+  const result = await createProject({ projectPath: '/review/project' }, {
+    validatePath: async () => ({ valid: false, error: 'outside writable roots' }),
+    resolveReviewProjectPath: async () => '/canonical/review/project',
+    ensureWorkspaceDirectory: async () => { ensuredDirectory = true; },
+    persistProjectPath: (projectPath) => ({ outcome: 'created', project: { ...projectRow, project_path: projectPath } }),
+    getProjectByPath: () => null,
+  });
+  assert.equal(ensuredDirectory, false);
+  assert.equal(result.project.path, '/canonical/review/project');
+});
+
+test('an unavailable review directory is not registered or created', async () => {
+  await assert.rejects(createProject({ projectPath: '/missing/review' }, {
+    validatePath: async () => ({ valid: false, error: 'outside writable roots' }),
+    resolveReviewProjectPath: async () => null,
+    ensureWorkspaceDirectory: async () => { throw new Error('must not create review folders'); },
+    persistProjectPath: () => { throw new Error('must not register missing review folders'); },
+    getProjectByPath: () => null,
+  }), (error: unknown) => error instanceof AppError && error.code === 'INVALID_PROJECT_PATH');
+});
 
 test('createProject throws when project path is missing', async () => {
   await assert.rejects(

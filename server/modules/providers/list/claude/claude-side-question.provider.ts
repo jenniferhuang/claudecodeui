@@ -1,7 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
-import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
-import { errorMessage, SIDE_QUESTION_ANSWER_SEPARATOR } from '@/shared/utils.js';
+import { resolveClaudeCodeExecutablePath, errorMessage, SIDE_QUESTION_ANSWER_SEPARATOR } from '@/shared/index.js';
 import type {
   AnyRecord,
   BackgroundTaskSummary,
@@ -9,7 +8,7 @@ import type {
   SideQuestionOutcome,
   SideQuestionRequest,
   SideQuestionSink,
-} from '@/shared/types.js';
+} from '@/shared/index.js';
 
 /**
  * Asks a question on the side of a Claude session, on a read-only fork of
@@ -98,6 +97,7 @@ async function runSideQuestionQuery(
 
   const options: AnyRecord = {
     ...extraOptions,
+    ...(process.env.CLOUDCLI_PROCESS_SANDBOX === '1' ? { sandbox: { enabled: false } } : {}),
     persistSession: false,
     tools: SIDE_QUESTION_TOOLS,
     allowedTools: SIDE_QUESTION_TOOLS,

@@ -28,10 +28,30 @@ async function runCliBootstrapFixture(isPlatform: boolean): Promise<BootstrapRes
   const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'cloudcli-cli-bootstrap-'));
   const fixtureServerDirectory = path.join(fixtureRoot, 'server');
   const fixtureCliDirectory = path.join(fixtureServerDirectory, 'modules', 'cli');
+  const fixturePolicyDirectory = path.join(fixtureServerDirectory, 'modules', 'filesystem-policy');
   const fixtureDatabasePath = path.join(fixtureRoot, 'auth.db');
 
   try {
+    await writeFile(path.join(fixtureRoot, 'package.json'), '{"type":"module"}\n', 'utf8');
     await mkdir(fixtureCliDirectory, { recursive: true });
+    await mkdir(fixturePolicyDirectory, { recursive: true });
+    // These fixtures exercise .env/auth initialization, independently of the
+    // operator's real optional filesystem policy. The policy module has its
+    // own bootstrap and native sandbox tests with isolated home directories.
+    await writeFile(
+      path.join(fixturePolicyDirectory, 'index.ts'),
+      `export async function initializeFilesystemPolicy(): Promise<void> {
+        if (process.env.CLOUDCLI_FILESYSTEM_POLICY !== ${JSON.stringify(path.join(fixtureRoot, 'policy.json'))}
+          || process.env.DATABASE_PATH !== ${JSON.stringify(fixtureDatabasePath)}) {
+          throw new Error('Deployment policy and database settings were not loaded before the policy bootstrap');
+        }
+        if (process.env.CLOUDCLI_PROCESS_SANDBOX || process.env.CLOUDCLI_SANDBOX_ACTIVE
+          || process.env.CLOUDCLI_SANDBOX_PROFILE || process.env.CLOUDCLI_WRITE_ROOTS || process.env.CLOUDCLI_READ_ROOTS) {
+          throw new Error('Package .env fabricated a filesystem sandbox marker');
+        }
+      }\n`,
+      'utf8',
+    );
     await Promise.all([
       copyFile(
         path.join(applicationRoot, 'server', 'load-env.ts'),
@@ -47,6 +67,12 @@ async function runCliBootstrapFixture(isPlatform: boolean): Promise<BootstrapRes
       [
         `VITE_IS_PLATFORM=${String(isPlatform)}`,
         `DATABASE_PATH=${fixtureDatabasePath.replace(/\\/g, '/')}`,
+        `CLOUDCLI_FILESYSTEM_POLICY=${path.join(fixtureRoot, 'policy.json').replace(/\\/g, '/')}`,
+        'CLOUDCLI_PROCESS_SANDBOX=1',
+        'CLOUDCLI_SANDBOX_ACTIVE=1',
+        'CLOUDCLI_SANDBOX_PROFILE=/untrusted/profile.sb',
+        'CLOUDCLI_WRITE_ROOTS=["/"]',
+        'CLOUDCLI_READ_ROOTS=["/"]',
       ].join('\n'),
       'utf8',
     );
@@ -131,6 +157,9 @@ export function createCliApplication() {
     const childEnvironment = { ...process.env };
     delete childEnvironment.VITE_IS_PLATFORM;
     delete childEnvironment.DATABASE_PATH;
+    for (const key of ['CLOUDCLI_FILESYSTEM_POLICY', 'CLOUDCLI_PROCESS_SANDBOX', 'CLOUDCLI_SANDBOX_ACTIVE', 'CLOUDCLI_SANDBOX_PROFILE', 'CLOUDCLI_WRITE_ROOTS', 'CLOUDCLI_READ_ROOTS']) {
+      delete childEnvironment[key];
+    }
     const stdout = execFileSync(
       process.execPath,
       [

@@ -14,8 +14,8 @@ import type {
   FileTreeServiceDependencies,
   FileTreeServices,
   FileTreeStats,
-} from '@/shared/types.js';
-import { AppError, resolveReadOnlyRootPath, validateWorkspacePath } from '@/shared/utils.js';
+} from '@/shared/index.js';
+import { AppError, resolveReadOnlyRootPath, validateWorkspacePath } from '@/shared/index.js';
 
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
@@ -94,6 +94,56 @@ function createDependencies(
     logger: { error: () => undefined },
   };
 }
+
+test('an indexed review-only project remains readable and rejects every mutation before filesystem writes', async () => {
+  const projectRoot = path.resolve('review-project');
+  const reviewedFile = path.join(projectRoot, 'notes.txt');
+  const cleanedUploads: string[] = [];
+  const fileSystem = createFakeFileSystem({
+    readTextFile: async () => 'review only',
+    unlink: async (filePath) => { cleanedUploads.push(filePath); },
+  });
+  const dependencies = createDependencies(fileSystem, projectRoot);
+  dependencies.workspace.resolveReadOnlyRootPath = async (candidatePath) => candidatePath;
+  dependencies.workspace.validateWritePath = async () => ({ valid: false, error: 'outside writable roots' });
+  const service = createFileTreeService(dependencies);
+  assert.equal((await service.readTextFile('old-project', reviewedFile)).content, 'review only');
+  const isReadOnly = (error: unknown) => error instanceof AppError && error.statusCode === 403 && error.code === 'READ_ONLY_WORKSPACE';
+  await assert.rejects(service.saveTextFile('old-project', reviewedFile, 'changed'), isReadOnly);
+  await assert.rejects(service.createEntry({ projectId: 'old-project', parentPath: '', name: 'new.txt', type: 'file' }), isReadOnly);
+  await assert.rejects(service.renameEntry({ projectId: 'old-project', oldPath: reviewedFile, newName: 'renamed.txt' }), isReadOnly);
+  await assert.rejects(service.deleteEntry({ projectId: 'old-project', targetPath: reviewedFile }), isReadOnly);
+  await assert.rejects(service.storeUploadedFiles({
+    projectId: 'old-project', targetPath: '', files: [{ originalName: 'new.txt', temporaryPath: '/temporary/upload.txt', size: 1, mimeType: 'text/plain' }],
+    relativePaths: [], requestedFileCount: 1,
+  }), isReadOnly);
+  assert.deepEqual(cleanedUploads, ['/temporary/upload.txt']);
+});
+
+test('the default folder picker includes additional writable roots as shortcuts', async () => {
+  const primary = path.resolve('workspace-primary');
+  const extra = path.resolve('workspace-extra');
+  const fileSystem = createFakeFileSystem({
+    access: async () => undefined,
+    stat: async () => createStats(true, 0o755),
+    realpath: async (candidatePath) => candidatePath,
+    openDirectory: createDirectoryReader(() => []),
+  });
+  const dependencies = createDependencies(fileSystem, primary);
+  dependencies.workspace.allowedRoots = [primary, extra];
+  const service = createFileTreeService(dependencies);
+  assert.deepEqual((await service.browseWorkspace(null)).suggestions, [{ path: extra, name: path.basename(extra), type: 'directory' }]);
+  assert.equal((await service.browseWorkspace(extra)).path, extra);
+});
+
+test('the OS sandbox EPERM result is reported as a permission error rather than a server failure', async () => {
+  const projectRoot = path.resolve('sandboxed-project');
+  const fileSystem = createFakeFileSystem({
+    writeTextFile: async () => { throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' }); },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+  await assert.rejects(service.saveTextFile('project', 'notes.txt', 'changed'), (error: unknown) => error instanceof AppError && error.statusCode === 403);
+});
 
 test('listProjectFiles applies gitignore alongside hard directory exclusions', async () => {
   const projectRoot = path.resolve('file-tree-test-project');

@@ -6,7 +6,8 @@ import test from 'node:test';
 import express, { type RequestHandler } from 'express';
 
 import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
-import type { FileTreeServices } from '@/shared/types.js';
+import { AppError } from '@/shared/index.js';
+import type { FileTreeServices } from '@/shared/index.js';
 
 function createFakeServices(overrides: Partial<FileTreeServices> = {}): FileTreeServices {
   const unexpectedOperation = async (): Promise<never> => {
@@ -73,6 +74,19 @@ test('project files route uses the File Tree API namespace and forwards the proj
   });
 
   assert.deepEqual(inputs, [['project-1', { respectGitignore: false }]]);
+});
+
+test('editing a review-only project returns the service permission error to the UI', async () => {
+  const services = createFakeServices({
+    saveTextFile: async () => { throw new AppError('This folder is read-only in the server filesystem policy.', { statusCode: 403, code: 'READ_ONLY_WORKSPACE' }); },
+  });
+  await withFileTreeServer(services, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/file-tree/projects/review-project/file`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath: 'notes.txt', content: 'changed' }),
+    });
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: 'This folder is read-only in the server filesystem policy.' });
+  });
 });
 
 test('project files route requests gitignore filtering when explicitly enabled', async () => {

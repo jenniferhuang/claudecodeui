@@ -145,6 +145,12 @@ CloudCLI UI is the open source UI layer that powers CloudCLI Cloud. You can self
 
 ## Security & Tools Configuration
 
+On macOS, the optional [server filesystem policy](docs/filesystem-permissions.md)
+lets the server owner allow edits in selected folders while other local folders
+remain available for review. It applies to the server and child processes;
+the agent permission dropdown cannot expand this boundary. The policy is stored
+outside the installed package and can be reused across fork upgrades.
+
 **🔒 Important Notice**: All Claude Code tools are **disabled by default**. This prevents potentially harmful operations from running automatically.
 
 ### Enabling Tools

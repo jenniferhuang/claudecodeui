@@ -417,6 +417,33 @@ const themeSettingsPath = (theme: string) =>
   path.join(os.homedir(), '.cloudcli', `claude-shell-theme-${theme}.json`);
 const themeFlag = (theme: string) => ` --settings '${themeSettingsPath(theme)}'`;
 
+test('Codex Shell retains no-daemon ownership and uses the inherited process sandbox', (t) => {
+  const previous = process.env.CLOUDCLI_PROCESS_SANDBOX;
+  process.env.CLOUDCLI_PROCESS_SANDBOX = '1';
+  t.after(() => { if (previous === undefined) delete process.env.CLOUDCLI_PROCESS_SANDBOX; else process.env.CLOUDCLI_PROCESS_SANDBOX = previous; });
+  const { calls, dependencies } = spawnRecorder('native-thread');
+  launch(dependencies, { provider: 'codex', hasSession: true, attachOnly: false });
+  const executable = os.platform() === 'win32' ? 'codex' : 'exec codex';
+  assert.equal(calls[0].command, `${executable} --no-daemon --sandbox danger-full-access resume "native-thread"`);
+  assert.doesNotMatch(calls[0].command, /\|\|/);
+});
+
+test('Claude Shell merges inherited-sandbox settings into its theme file without replacing the theme', (t) => {
+  const previous = process.env.CLOUDCLI_PROCESS_SANDBOX;
+  process.env.CLOUDCLI_PROCESS_SANDBOX = '1';
+  t.after(() => { if (previous === undefined) delete process.env.CLOUDCLI_PROCESS_SANDBOX; else process.env.CLOUDCLI_PROCESS_SANDBOX = previous; });
+  withClaudeConfig(({ home, projectPath }) => {
+    const { calls, dependencies } = spawnRecorder();
+    launch(dependencies, { provider: 'claude', colorScheme: 'light', bypassPermissions: true }, projectPath);
+    assert.equal((calls[0].command.match(/--settings/g) ?? []).length, 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, '.cloudcli', 'claude-shell-theme-light.json'), 'utf8')), {
+      theme: 'light', sandbox: { enabled: false },
+    });
+    launch(dependencies, { provider: 'claude', colorScheme: 'dark' }, projectPath);
+    assert.match(calls[1].command, /--settings '\{"sandbox":\{"enabled":false\}\}'/);
+  });
+});
+
 // The flag outranks the user's own settings, so a dark Shell tab must not send
 // one: it would turn a daltonized or ANSI theme back into the plain dark one.
 test('a dark Shell tab launches claude exactly as before, whatever the user theme is', () => {

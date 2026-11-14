@@ -2,14 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { askClaudeSideQuestion } from '@/modules/providers/list/claude/claude-side-question.provider.js';
-import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
+import { resolveClaudeCodeExecutablePath } from '@/shared/index.js';
 import type {
   AnyRecord,
   BackgroundTaskSummary,
   ProviderRuntimeContext,
   SideQuestionOutcome,
   SideQuestionRequest,
-} from '@/shared/types.js';
+} from '@/shared/index.js';
 
 /**
  * A side question runs on a read-only fork of the Claude session. These drive
@@ -229,6 +229,23 @@ test('the fork resumes the session read-only with every measured option', { time
 
   script.emit(assistantText('In src/router.ts.'));
   script.emit(result('success', 'In src/router.ts.'));
+  await outcome;
+});
+
+test('a Claude side question inherits the server boundary and retains its read-only tool list', { timeout: 5000 }, async (t) => {
+  const previous = process.env.CLOUDCLI_PROCESS_SANDBOX;
+  process.env.CLOUDCLI_PROCESS_SANDBOX = '1';
+  t.after(() => { if (previous === undefined) delete process.env.CLOUDCLI_PROCESS_SANDBOX; else process.env.CLOUDCLI_PROCESS_SANDBOX = previous; });
+  const { script, outcome } = startFork();
+  await waitFor(() => script.calls.length === 1);
+  const { options } = script.calls[0]!;
+  assert.deepEqual(options.sandbox, { enabled: false });
+  assert.deepEqual(options.tools, ['Read', 'Grep', 'Glob']);
+  assert.deepEqual(options.allowedTools, ['Read', 'Grep', 'Glob']);
+  assert.equal(options.permissionMode, 'dontAsk');
+  assert.equal(options.strictMcpConfig, true);
+  script.emit(assistantText('ok'));
+  script.emit(result('success', 'ok'));
   await outcome;
 });
 

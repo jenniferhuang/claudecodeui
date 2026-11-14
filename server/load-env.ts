@@ -4,6 +4,8 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { initializeFilesystemPolicy } from './modules/filesystem-policy/index.js';
+
 // This bootstrap cannot import shared/utils.ts: that module reads environment
 // defaults during evaluation, before this file has loaded `.env`.
 function getBootstrapApplicationRoot(importMetaUrl: string) {
@@ -22,6 +24,13 @@ function getBootstrapApplicationRoot(importMetaUrl: string) {
 // same top-level .env file from both /server/load-env.ts and /dist-server/server/load-env.js.
 const APP_ROOT = getBootstrapApplicationRoot(import.meta.url);
 
+// Only bootstrap's sandboxed replacement may set these fields. In particular,
+// a package .env cannot claim that a normal process already has an OS sandbox.
+const RESERVED_FILESYSTEM_POLICY_KEYS = new Set([
+  'CLOUDCLI_PROCESS_SANDBOX', 'CLOUDCLI_SANDBOX_ACTIVE', 'CLOUDCLI_SANDBOX_PROFILE',
+  'CLOUDCLI_WRITE_ROOTS', 'CLOUDCLI_READ_ROOTS',
+]);
+
 try {
   const envPath = path.join(APP_ROOT, '.env');
   const envFile = fs.readFileSync(envPath, 'utf8');
@@ -29,7 +38,7 @@ try {
     const trimmedLine = line.trim();
     if (trimmedLine && !trimmedLine.startsWith('#')) {
       const [key, ...valueParts] = trimmedLine.split('=');
-      if (key && valueParts.length > 0 && !process.env[key]) {
+      if (key && !RESERVED_FILESYSTEM_POLICY_KEYS.has(key) && valueParts.length > 0 && !process.env[key]) {
         process.env[key] = valueParts.join('=').trim();
       }
     }
@@ -45,3 +54,8 @@ const DEFAULT_DATABASE_PATH = path.join(os.homedir(), '.cloudcli', 'auth.db');
 if (!process.env.DATABASE_PATH) {
   process.env.DATABASE_PATH = DEFAULT_DATABASE_PATH;
 }
+
+// Normal deployment .env settings (including policy location and database
+// path) are now available. Awaiting the policy replacement here still prevents
+// later server imports from running outside the configured process boundary.
+await initializeFilesystemPolicy();

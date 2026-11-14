@@ -13,7 +13,7 @@ import {
   queryClaudeSDK,
   resolveToolApproval,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
-import type { NormalizedMessage, ProviderRuntimeContext } from '@/shared/types.js';
+import type { AnyRecord, NormalizedMessage, ProviderRuntimeContext } from '@/shared/index.js';
 
 /**
  * An MCP server can ask the person for input in the middle of a tool call. The
@@ -29,17 +29,19 @@ const SESSION_ID = 'app-elicitation-session';
 type OnElicitation = (request: ElicitationRequest, options: { signal: AbortSignal; requestId: string }) => Promise<ElicitationResult>;
 
 async function withRun(
-  runTest: (context: { onElicitation: OnElicitation; sent: NormalizedMessage[] }) => Promise<void>,
+  runTest: (context: { onElicitation: OnElicitation; sent: NormalizedMessage[]; sdkOptions: AnyRecord }) => Promise<void>,
 ): Promise<void> {
   const cwd = await mkdtemp(path.join(os.tmpdir(), 'claude-elicitation-'));
   const sent: NormalizedMessage[] = [];
   const writer = { send: (message: NormalizedMessage) => { sent.push(message); }, userId: null };
   const sessions = new ClaudeSessionsProvider({ getLiveRunStartTime: () => null });
   let captured: OnElicitation | null = null;
+  let sdkOptions: AnyRecord = {};
   let finish: () => void = () => {};
   const finished = new Promise<void>((resolve) => { finish = resolve; });
 
   const createQuery: NonNullable<ProviderRuntimeContext['createQuery']> = ({ options }) => {
+    sdkOptions = options;
     captured = (options as { onElicitation?: OnElicitation }).onElicitation ?? null;
     // Holds the run open until the test is done, and yields nothing: only the
     // options passed in matter here.
@@ -65,7 +67,7 @@ async function withRun(
       await new Promise((resolve) => { setTimeout(resolve, 10); });
     }
     assert.ok(captured, 'queryClaudeSDK passed no onElicitation to the SDK');
-    await runTest({ onElicitation: captured, sent });
+    await runTest({ onElicitation: captured, sent, sdkOptions });
     finish();
     await done;
   } finally {
@@ -83,6 +85,17 @@ const form: ElicitationRequest = {
     required: ['target'],
   },
 };
+
+for (const inheritedSandbox of [false, true]) {
+  test(`Claude SDK ${inheritedSandbox ? 'uses the inherited process sandbox' : 'keeps native sandbox settings unchanged'}`, async (t) => {
+    const previous = process.env.CLOUDCLI_PROCESS_SANDBOX;
+    if (inheritedSandbox) process.env.CLOUDCLI_PROCESS_SANDBOX = '1'; else delete process.env.CLOUDCLI_PROCESS_SANDBOX;
+    t.after(() => { if (previous === undefined) delete process.env.CLOUDCLI_PROCESS_SANDBOX; else process.env.CLOUDCLI_PROCESS_SANDBOX = previous; });
+    await withRun(async ({ sdkOptions }) => {
+      assert.deepEqual(sdkOptions.sandbox, inheritedSandbox ? { enabled: false } : undefined);
+    });
+  });
+}
 
 /** Calls the callback, waits for its permission request, answers it, and returns both. */
 async function ask(

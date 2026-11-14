@@ -6,11 +6,11 @@ import test from 'node:test';
 
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import { codexRuntime } from '@/modules/providers/list/codex/codex-runtime.provider.js';
-import type { ProviderRuntimeContext, SideQuestionOutcome, SideQuestionRequest } from '@/shared/types.js';
+import type { ProviderRuntimeContext, SideQuestionOutcome, SideQuestionRequest } from '@/shared/index.js';
 import {
   SIDE_CONVERSATION_BOUNDARY_PROMPT,
   SIDE_CONVERSATION_DEVELOPER_INSTRUCTIONS,
-} from '@/shared/utils.js';
+} from '@/shared/index.js';
 
 /**
  * A Codex side question is an ephemeral, read-only `thread/fork` with Codex's
@@ -255,6 +255,22 @@ test('the fork is ephemeral, read-only and carries the side-conversation instruc
         features: { plugins: false },
       },
     });
+  });
+});
+
+test('an inherited server sandbox avoids a nested Codex sandbox while keeping fork exclusions', { concurrency: false }, async (t) => {
+  const previous = process.env.CLOUDCLI_PROCESS_SANDBOX;
+  process.env.CLOUDCLI_PROCESS_SANDBOX = '1';
+  t.after(() => { if (previous === undefined) delete process.env.CLOUDCLI_PROCESS_SANDBOX; else process.env.CLOUDCLI_PROCESS_SANDBOX = previous; });
+  await withFakeAppServer('complete', async ({ received }) => {
+    await appServer.askSideQuestion!(askInput(), () => {});
+    const fork = (await received()).find((line) => line.method === 'thread/fork');
+    assert.equal(fork?.params.sandbox, 'danger-full-access');
+    assert.equal(fork?.params.approvalPolicy, 'never');
+    assert.equal(fork?.params.developerInstructions, SIDE_CONVERSATION_DEVELOPER_INSTRUCTIONS);
+    assert.equal(fork?.params.config.web_search, 'disabled');
+    assert.deepEqual(fork?.params.config.features, { plugins: false });
+    assert.deepEqual(fork?.params.config.apps, { _default: { enabled: false } });
   });
 });
 
