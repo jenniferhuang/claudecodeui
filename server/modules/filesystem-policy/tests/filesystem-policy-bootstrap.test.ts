@@ -181,7 +181,7 @@ test('runtime filename exceptions cannot serve as mutable policy selectors', asy
   t.after(() => fixture.cleanup());
   fixture.writeConfig();
   let launches = 0;
-  for (const relative of ['.cloudcli/claude-shell-theme-light.json', '.codex/state_5.sqlite']) {
+  for (const relative of ['.cloudcli/claude-shell-theme-light.json', '.codex/state_5.sqlite', '.codex/installation_id']) {
     const alias = path.join(fixture.homeDirectory, relative);
     fs.mkdirSync(path.dirname(alias), { recursive: true });
     fs.symlinkSync(fixture.configPath, alias);
@@ -240,7 +240,7 @@ test('auth and database symlinks cannot turn an unrelated document into writable
   fixture.writeConfig();
   const document = path.join(fixture.review, 'invoice.txt');
   fs.writeFileSync(document, 'review only');
-  for (const stateFile of ['.cloudcli/auth.db', '.codex/auth.json']) {
+  for (const stateFile of ['.cloudcli/auth.db', '.codex/auth.json', '.codex/installation_id']) {
     const statePath = path.join(fixture.homeDirectory, stateFile);
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     fs.symlinkSync(document, statePath);
@@ -338,7 +338,7 @@ for (const scenario of [
   { name: 'default Claude file credential refresh', key: null, root: '.claude', writable: ['.credentials.json', '.config.json', 'backups/.claude.json.backup.12345'], denied: ['settings.json', '.credentials.json.tmp.not-refresh', '.credentials.json.tmp.1234567', '.credentials.json.tmp.123456789', '.credentials.json.tmp.1234abcd.extra', '.config.json.tmp.123.123456abcde', '.config.json.tmp.123.123456abcdef.extra', '.oauth_refresh.lock.owner.tmp.not-refresh', 'unrelated-project/note.txt'] },
   { name: 'CLAUDE_CONFIG_DIR runtime state', key: 'CLAUDE_CONFIG_DIR', root: 'custom-claude', writable: ['.credentials.json', '.claude.json', '.config.json', 'projects/example/session.jsonl', 'backups/.config.json.corrupted.12345'], denied: ['settings.json', '.credentials.json.tmp.not-refresh', '.claude.json.unrelated/note.txt', 'unrelated-project/note.txt'] },
   { name: 'CLAUDE_SECURESTORAGE_CONFIG_DIR credential state', key: 'CLAUDE_SECURESTORAGE_CONFIG_DIR', root: 'custom-credentials', writable: ['.credentials.json'], denied: ['settings.json', 'projects/session.jsonl', 'unrelated-project/note.txt'] },
-  { name: 'CODEX_HOME runtime state', key: 'CODEX_HOME', root: 'custom-codex', writable: ['auth.json', 'sessions/session.jsonl', 'state_5.sqlite'], denied: ['config.toml', 'unrelated-project/note.txt'] },
+  { name: 'CODEX_HOME runtime state', key: 'CODEX_HOME', root: 'custom-codex', writable: ['auth.json', 'installation_id', 'sessions/session.jsonl', 'state_5.sqlite'], denied: ['config.toml', 'unrelated-project/note.txt'] },
   { name: 'XDG_DATA_HOME OpenCode state', key: 'XDG_DATA_HOME', root: 'custom-data', writable: ['opencode/auth.json', 'opencode/storage/session.json'], denied: ['unrelated-project/note.txt', 'opencode-sibling/auth.json'] },
 ] as const) {
   test(`native macOS provider state permits ${scenario.name} while unrelated files stay read-only`, { skip: process.platform !== 'darwin' }, async (t) => {
@@ -476,3 +476,36 @@ test('without a policy provider state selectors retain their existing behavior',
   });
   assert.equal(fs.existsSync(path.join(fixture.homeDirectory, '.cloudcli')), false);
 });
+
+for (const scenario of [
+  { name: 'default Codex home', directory: '.codex', custom: false },
+  { name: 'configured CODEX_HOME', directory: 'custom-codex', custom: true },
+]) {
+  test(`native macOS policy lets ${scenario.name} refresh its installation identity marker`, { skip: process.platform !== 'darwin' }, async (t) => {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    fixture.writeConfig();
+    const codexDirectory = path.join(fixture.homeDirectory, scenario.directory);
+    fs.mkdirSync(codexDirectory);
+    const installationId = path.join(codexDirectory, 'installation_id');
+    fs.writeFileSync(installationId, 'existing-installation');
+    const capture = await captureProviderPolicy(fixture, scenario.custom ? { CODEX_HOME: codexDirectory } : {});
+    const script = `
+      const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
+      const installationId = process.argv[1];
+      const descriptor = fs.openSync(installationId, 'r+');
+      try { fs.futimesSync(descriptor, 1_700_000_000, 1_700_000_000); }
+      finally { fs.closeSync(descriptor); }
+      assert.equal(fs.readFileSync(installationId, 'utf8'), 'existing-installation');
+      assert.equal(fs.statSync(installationId).mtimeMs, 1_700_000_000_000);
+      assert.throws(() => fs.writeFileSync(path.join(path.dirname(installationId), 'unrelated-marker'), 'blocked'), /EPERM|EACCES/);
+      console.log('installation identity refresh passed');
+    `;
+    const native = spawnSync('/usr/bin/sandbox-exec', [
+      '-f', capture.profilePath, process.execPath, '-e', script, installationId,
+    ], { encoding: 'utf8', env: capture.environment, timeout: 15_000 });
+    assert.equal(native.status, 0, native.stderr || native.stdout);
+    assert.match(native.stdout, /installation identity refresh passed/);
+    assert.equal(fs.existsSync(path.join(codexDirectory, 'unrelated-marker')), false);
+  });
+}

@@ -142,7 +142,7 @@ function operationalWritePaths(homeDirectory: string, environment: NodeJS.Proces
       '.cloudcli/launchd.stdout.log', '.cloudcli/launchd.stderr.log', '.claude-code-ui/plugins.json',
     ].map((entry) => path.join(homeDirectory, entry)),
     ...['auth.json', 'auth.lock', 'models_cache.json', 'history.jsonl',
-      'session_index.jsonl', 'session_index.jsonl.lock', 'version.json', '.sqlite-maintenance.lock',
+      'session_index.jsonl', 'session_index.jsonl.lock', 'version.json', 'installation_id', '.sqlite-maintenance.lock',
     ].map((entry) => path.join(codexHome, entry)),
     globalClaudeConfig, `${globalClaudeConfig}.lock`, legacyClaudeConfig, `${legacyClaudeConfig}.lock`,
     claudeCredentials, refreshOwner,
