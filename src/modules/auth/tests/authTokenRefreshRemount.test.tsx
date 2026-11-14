@@ -141,6 +141,9 @@ test('tokens refreshed while the workspace is open do not remount it', async () 
   renderApp();
   await screen.findByText('workspace');
   assert.equal(workspaceMounts, 1);
+  // The aged token is already due for a scheduled background refresh. Let
+  // that setup request arrive before measuring the later token rotations.
+  await waitFor(() => assert.ok(requestedPaths.includes('/api/auth/refresh')));
   const bootstrapRequests = requestedPaths.length;
 
   // In-flight requests that still carried the aged token each come back with

@@ -78,6 +78,8 @@ type Scenario = {
   forkStatus?: number;
   /** How long DELETE /session/:id takes to answer. */
   deleteDelayMs?: number;
+  /** Optional file whose creation releases a held DELETE response. */
+  deleteReleaseFile?: string;
   /** How long the server takes to print its listening line; `{ spawned }` is logged at once. */
   listenDelayMs?: number;
   agents?: Array<{ name: string; permission: PermissionRule[] }>;
@@ -411,6 +413,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'DELETE') {
+      while (scenario.deleteReleaseFile && !fs.existsSync(scenario.deleteReleaseFile)) {
+        await sleep(10);
+      }
       if (scenario.deleteDelayMs) {
         await sleep(scenario.deleteDelayMs);
       }
