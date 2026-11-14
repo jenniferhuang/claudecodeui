@@ -31,6 +31,7 @@ async function withSessions(runTest: (context: {
   terminal: { killed: boolean; emitExit: () => void };
   directory: string;
   setChatBusy: (busy: boolean) => void;
+  connectShell: (connection: ReturnType<typeof createSocket>) => void;
 }) => Promise<void>) {
   const previousDatabasePath = process.env.DATABASE_PATH;
   const directory = await mkdtemp(path.join(os.tmpdir(), 'codex-shell-handoff-'));
@@ -63,12 +64,13 @@ async function withSessions(runTest: (context: {
         run: async (_provider: string, _command: string, options: { sessionId: string }) => { runs.push(options.sessionId); },
       } as never,
     });
-    handleShellConnection(shell as never, {
+    const connectShell = (connection: ReturnType<typeof createSocket>) => handleShellConnection(connection as never, {
       resolveProviderSessionId: (id) => sessionsDb.getSessionById(id)?.provider_session_id ?? id,
       isChatSessionRunning: () => chatBusy,
       spawnPty: (_shell, args) => { launches.push(String(args.at(-1))); return terminal as never; },
     });
-    await runTest({ chat, shell, launches, runs, terminal, directory, setChatBusy: (busy) => { chatBusy = busy; } });
+    connectShell(shell);
+    await runTest({ chat, shell, launches, runs, terminal, directory, connectShell, setChatBusy: (busy) => { chatBusy = busy; } });
   } finally {
     terminal.emitExit();
     connectedClients.clear();
@@ -151,3 +153,28 @@ test('an explicit End keeps Chat blocked until the PTY exit event', async () => 
     assert.deepEqual(runs, ['handoff']);
   });
 });
+
+for (const reason of ['stopping', 'force restart'] as const) {
+  test(`Codex Shell initialization reports a retryable connection state while ${reason}`, async () => {
+    await withSessions(async ({ shell, launches, terminal, directory, connectShell }) => {
+      const init = { type: 'init', provider: 'codex', sessionId: 'handoff',
+        hasSession: true, projectPath: directory, attachOnly: false };
+      shell.emit('message', JSON.stringify(init));
+      if (reason === 'stopping') {
+        shell.emit('message', JSON.stringify({ type: 'terminate' }));
+        shell.emit('close');
+      }
+
+      const retry = createSocket();
+      connectShell(retry);
+      retry.emit('message', JSON.stringify({ ...init, forceRestart: reason === 'force restart' }));
+      assert.equal(launches.length, 1, 'a rejected Connect must preserve the original terminal');
+      assert.equal(retry.frames.at(-1)?.code, 'SHELL_SESSION_ACTIVE',
+        'the connection hook needs a classified rejection to expose Connect again');
+
+      terminal.emitExit();
+      retry.emit('message', JSON.stringify(init));
+      assert.equal(launches.length, 2, 'Connect may start another terminal after the original exits');
+    });
+  });
+}

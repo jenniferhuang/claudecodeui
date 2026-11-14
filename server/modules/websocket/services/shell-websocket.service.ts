@@ -632,11 +632,11 @@ export function handleShellConnection(
 
         const retainedSession = ptySessionsMap.get(ptySessionKey);
         if (retainedSession?.terminating) {
-          ws.send(JSON.stringify({ type: 'error', message: 'This terminal is stopping. Wait for it to exit before reconnecting.' }));
+          ws.send(JSON.stringify({ type: 'error', code: 'SHELL_SESSION_ACTIVE', message: 'This terminal is stopping. Wait for it to exit before reconnecting.' }));
           return;
         }
         if ((isLoginCommand || forceRestart) && retainedSession?.provider === 'codex') {
-          ws.send(JSON.stringify({ type: 'error', message: 'End the existing Codex Shell and wait for it to exit before connecting again.' }));
+          ws.send(JSON.stringify({ type: 'error', code: 'SHELL_SESSION_ACTIVE', message: 'End the existing Codex Shell and wait for it to exit before connecting again.' }));
           return;
         }
 
