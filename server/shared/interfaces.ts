@@ -302,4 +302,12 @@ export interface IProviderSessionSynchronizer {
    * Parses and upserts one provider artifact file without running a full scan.
    */
   synchronizeFile(filePath: string): Promise<string | null>;
+
+  /**
+   * Refreshes display names from a provider's metadata index without rescanning
+   * transcripts. The providers watcher uses the returned app-facing ids to
+   * announce changed sidebar titles. Providers without a separate name index
+   * can omit this operation.
+   */
+  synchronizeNames?(): Promise<string[]>;
 }

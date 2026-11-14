@@ -14,8 +14,8 @@ import type {
   LLMProvider,
   NormalizedMessage,
   WorkflowAgentActivity,
-} from '@/shared/types.js';
-import { AppError, sliceTailPage } from '@/shared/utils.js';
+} from '@/shared/index.js';
+import { AppError, sliceTailPage } from '@/shared/index.js';
 
 /**
  * One session the running-sessions poll reports as busy.
@@ -757,7 +757,7 @@ export const sessionsService = {
       });
     }
 
-    sessionsDb.updateSessionCustomName(sessionId, summary);
+    sessionsDb.renameSessionCustomName(sessionId, summary);
     return { sessionId, summary };
   },
 };

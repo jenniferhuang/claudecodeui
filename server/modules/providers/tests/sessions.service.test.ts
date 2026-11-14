@@ -66,6 +66,18 @@ test('app sessions without message text receive a stable fallback name', { concu
   });
 });
 
+test('sidebar rename records a user title that subsequent provider imports preserve', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createSession('sidebar-renamed', 'codex', '/tmp/session-name-project', 'Provider title');
+    assert.deepEqual(sessionsService.renameSessionById('sidebar-renamed', 'My chosen title'), {
+      sessionId: 'sidebar-renamed', summary: 'My chosen title',
+    });
+    assert.equal(sessionsDb.getSessionById('sidebar-renamed')?.custom_name_source, 'user');
+    sessionsDb.createSession('sidebar-renamed', 'codex', '/tmp/session-name-project', 'New external title');
+    assert.equal(sessionsDb.getSessionById('sidebar-renamed')?.custom_name, 'My chosen title');
+  });
+});
+
 test('provider session id is unavailable until the provider assigns one', { concurrency: false }, async () => {
   await withIsolatedDatabase(() => {
     sessionsDb.createAppSession('pending-app-session', 'claude', '/tmp/session-id-copy-project');

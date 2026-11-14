@@ -131,6 +131,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- id mid-run, or equals \`session_id\` for sessions discovered on disk.
     provider_session_id TEXT,
     custom_name TEXT,
+    -- NULL keeps legacy titles unclassified until their provider history is
+    -- checked. A user title always wins over automatic provider imports.
+    custom_name_source TEXT CHECK (custom_name_source IN ('provider', 'user')),
     project_path TEXT,
     jsonl_path TEXT,
     -- Model and reasoning effort this session runs with. Written when the user

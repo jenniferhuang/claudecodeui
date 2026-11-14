@@ -408,6 +408,21 @@ const addProviderSessionIdMapping = (db: Database): void => {
 };
 
 /**
+ * Records title provenance without guessing whether an existing name was a
+ * sidebar override. Codex classifies NULL values against its index history.
+ */
+const addSessionCustomNameSourceColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(
+    db,
+    'sessions',
+    columnNames,
+    'custom_name_source',
+    "TEXT CHECK (custom_name_source IN ('provider', 'user'))"
+  );
+};
+
+/**
  * Adds the `forked_from_session_id` column recording where a branched session
  * came from.
  *
@@ -530,6 +545,7 @@ export const runMigrations = (db: Database) => {
     rebuildSessionsTableWithProjectSchema(db);
     migrateLegacySessionNames(db);
     addProviderSessionIdMapping(db);
+    addSessionCustomNameSourceColumn(db);
     addSessionModelColumn(db);
     addSessionEffortColumn(db);
     addForkedFromSessionIdColumn(db);

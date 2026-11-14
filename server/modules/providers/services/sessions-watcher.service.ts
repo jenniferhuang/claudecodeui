@@ -6,7 +6,7 @@ import chokidar, { type FSWatcher } from 'chokidar';
 
 import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
 import { broadcastSessionUpsertedBatch } from '@/modules/websocket/index.js';
-import type { LLMProvider } from '@/shared/types.js';
+import type { LLMProvider } from '@/shared/index.js';
 
 type WatcherEventType = 'add' | 'change';
 
@@ -28,6 +28,7 @@ const PROVIDER_WATCH_PATHS: Array<{ provider: LLMProvider; rootPath: string }> =
     rootPath: path.join(os.homedir(), '.local', 'share', 'opencode'),
   },
 ];
+const CODEX_INDEX_PATH = path.join(os.homedir(), '.codex', 'session_index.jsonl');
 
 /**
  * What the watcher never descends into or reports. These used to be glob
@@ -84,6 +85,9 @@ const PROJECTS_UPDATE_DEBOUNCE_MS = 500;
 const PROJECTS_UPDATE_MAX_WAIT_MS = 2_000;
 
 const watchers: FSWatcher[] = [];
+const watcherOperations = new Set<Promise<void>>();
+const nameRefreshes = new Map<LLMProvider, { dirty: boolean; promise: Promise<void> }>();
+let watchersClosing = false;
 
 type PendingWatcherUpdate = {
   providers: Set<LLMProvider>;
@@ -121,7 +125,7 @@ function clearPendingWatcherFlushTimer(): void {
 }
 
 function schedulePendingWatcherFlush(): void {
-  if (!pendingWatcherUpdate) {
+  if (!pendingWatcherUpdate || watchersClosing) {
     return;
   }
 
@@ -136,8 +140,42 @@ function schedulePendingWatcherFlush(): void {
 
   clearPendingWatcherFlushTimer();
   pendingWatcherFlushTimer = setTimeout(() => {
-    void flushPendingWatcherUpdate();
+    trackWatcherOperation(flushPendingWatcherUpdate());
   }, delay);
+}
+
+function trackWatcherOperation(operation: Promise<void>): void {
+  watcherOperations.add(operation);
+  void operation.then(
+    () => watcherOperations.delete(operation),
+    () => watcherOperations.delete(operation),
+  );
+}
+
+/** Coalesces index bursts and reruns when another rename arrives mid-refresh. */
+function refreshProviderNames(eventType: WatcherEventType, provider: LLMProvider): Promise<void> {
+  const existing = nameRefreshes.get(provider);
+  if (existing) {
+    existing.dirty = true;
+    return existing.promise;
+  }
+
+  const refresh = { dirty: true, promise: Promise.resolve() };
+  refresh.promise = (async () => {
+    try {
+      while (refresh.dirty) {
+        refresh.dirty = false;
+        const sessionIds = await sessionSynchronizerService.synchronizeProviderNames(provider);
+        for (const sessionId of sessionIds) {
+          queuePendingWatcherUpdate(eventType, provider, sessionId);
+        }
+      }
+    } finally {
+      nameRefreshes.delete(provider);
+    }
+  })();
+  nameRefreshes.set(provider, refresh);
+  return refresh.promise;
 }
 
 function queuePendingWatcherUpdate(
@@ -210,6 +248,11 @@ async function onUpdate(
   }
 
   try {
+    if (provider === 'codex' && path.resolve(filePath) === CODEX_INDEX_PATH) {
+      await refreshProviderNames(eventType, provider);
+      return;
+    }
+
     const result = await sessionSynchronizerService.synchronizeProviderFile(provider, filePath);
     if (!result.indexed) {
       return;
@@ -234,6 +277,7 @@ async function onUpdate(
  * Starts provider filesystem watchers and performs initial DB synchronization.
  */
 export async function initializeSessionsWatcher(): Promise<void> {
+  watchersClosing = false;
   console.log('Setting up session watchers');
 
   const initialSync = await sessionSynchronizerService.synchronizeSessions();
@@ -247,7 +291,12 @@ export async function initializeSessionsWatcher(): Promise<void> {
     try {
       await fsPromises.mkdir(rootPath, { recursive: true });
 
-      const watcher = chokidar.watch(rootPath, {
+      // An idle Codex thread rename only appends to this index; its transcript
+      // is unchanged. Include the exact file before establishing watch readiness.
+      const watchPaths = provider === 'codex'
+        ? [rootPath, CODEX_INDEX_PATH]
+        : rootPath;
+      const watcher = chokidar.watch(watchPaths, {
         ignored: createWatcherIgnoredMatcher(rootPath),
         persistent: true,
         ignoreInitial: true,
@@ -264,10 +313,10 @@ export async function initializeSessionsWatcher(): Promise<void> {
 
       watcher
         .on('add', (filePath: string) => {
-          void onUpdate('add', filePath, provider);
+          if (!watchersClosing) trackWatcherOperation(onUpdate('add', filePath, provider));
         })
         .on('change', (filePath: string) => {
-          void onUpdate('change', filePath, provider);
+          if (!watchersClosing) trackWatcherOperation(onUpdate('change', filePath, provider));
         })
         .on('error', (error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
@@ -275,6 +324,19 @@ export async function initializeSessionsWatcher(): Promise<void> {
         });
 
       watchers.push(watcher);
+      if (provider === 'codex') {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (error: unknown) => reject(error);
+          watcher.once('ready', () => {
+            watcher.off('error', onError);
+            resolve();
+          });
+          watcher.once('error', onError);
+        });
+        // ignoreInitial omits renames between the initial DB scan and ready.
+        // Reconcile after the watcher is listening so no startup rename is lost.
+        await refreshProviderNames('change', provider);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`Failed to initialize session watcher for provider "${provider}"`, {
@@ -289,6 +351,7 @@ export async function initializeSessionsWatcher(): Promise<void> {
  * Stops all active provider session watchers.
  */
 export async function closeSessionsWatcher(): Promise<void> {
+  watchersClosing = true;
   clearPendingWatcherFlushTimer();
 
   await Promise.all(
@@ -301,6 +364,11 @@ export async function closeSessionsWatcher(): Promise<void> {
       }
     })
   );
+  // Closing watchers stops new events; let accepted index/transcript work finish
+  // before callers close the database or start another watcher lifecycle.
+  await Promise.all(watcherOperations);
+  await Promise.all([...nameRefreshes.values()].map(({ promise }) => promise));
+  clearPendingWatcherFlushTimer();
   watchers.length = 0;
   pendingWatcherUpdate = null;
   pendingWatcherUpdateStartedAt = null;

@@ -3,7 +3,7 @@ import { access } from 'node:fs/promises';
 
 import { scanStateDb, sessionsDb } from '@/modules/database/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
-import type { LLMProvider } from '@/shared/types.js';
+import type { LLMProvider } from '@/shared/index.js';
 
 type SessionSynchronizeResult = {
   processedByProvider: Record<LLMProvider, number>;
@@ -157,5 +157,15 @@ export const sessionSynchronizerService = {
       indexed: Boolean(sessionId),
       sessionId,
     };
+  },
+
+  /**
+   * Refreshes metadata-only titles through the registry's shared synchronizer.
+   * The providers watcher uses the changed ids for sidebar deltas; providers
+   * without a separate title index have nothing to refresh.
+   */
+  async synchronizeProviderNames(provider: LLMProvider): Promise<string[]> {
+    const synchronizer = providerRegistry.resolveProvider(provider).sessionSynchronizer;
+    return synchronizer.synchronizeNames ? synchronizer.synchronizeNames() : [];
   },
 };

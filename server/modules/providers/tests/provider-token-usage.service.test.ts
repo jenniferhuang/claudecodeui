@@ -10,7 +10,7 @@ import {
   createProviderTokenUsageService,
   summarizeClaudeTokenUsage,
 } from '@/modules/providers/services/provider-token-usage.service.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError } from '@/shared/index.js';
 
 function createSessionRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -20,6 +20,7 @@ function createSessionRow(overrides: Record<string, unknown> = {}) {
     project_path: null,
     jsonl_path: null,
     custom_name: null,
+    custom_name_source: null,
     model: null,
     effort: null,
     forked_from_session_id: null,

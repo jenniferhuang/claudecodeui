@@ -1,7 +1,7 @@
 import { getConnection } from '@/modules/database/connection.js';
 import { projectsDb } from '@/modules/database/repositories/projects.db.js';
-import { normalizeProjectPath } from '@/shared/utils.js';
-import type { SessionForkAncestor } from '@/shared/types.js';
+import { normalizeProjectPath } from '@/shared/index.js';
+import type { SessionForkAncestor } from '@/shared/index.js';
 
 type SessionRow = {
   session_id: string;
@@ -10,6 +10,8 @@ type SessionRow = {
   project_path: string | null;
   jsonl_path: string | null;
   custom_name: string | null;
+  /** NULL marks a legacy title whose provider/user provenance is not known. */
+  custom_name_source: 'provider' | 'user' | null;
   /** Model this session runs with; NULL until the app records one for it. */
   model: string | null;
   /** Reasoning effort this session runs with; NULL until the app records one. */
@@ -26,8 +28,14 @@ type RecentSessionsPage = {
   total: number;
 };
 
+type NativeProviderSessionNameUpdate = {
+  sessionId: string;
+  customName: string;
+  source: NonNullable<SessionRow['custom_name_source']>;
+};
+
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, custom_name_source, model, effort, forked_from_session_id, isArchived, created_at, updated_at';
 
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
@@ -70,6 +78,7 @@ function normalizeProjectPathForProvider(provider: string, projectPath: string):
   return normalizeProjectPath(projectPath);
 }
 
+/** Providers and Projects use this repository to persist and read session metadata. */
 export const sessionsDb = {
   /**
    * Upserts one session row discovered on disk by a provider synchronizer.
@@ -116,6 +125,7 @@ export const sessionsDb = {
            jsonl_path = ?,
            isArchived = CASE WHEN ? IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
            custom_name = CASE
+             WHEN custom_name_source = 'user' THEN custom_name
              WHEN session_id <> provider_session_id AND custom_name IS NOT NULL THEN custom_name
              ELSE COALESCE(?, custom_name)
            END
@@ -138,8 +148,8 @@ export const sessionsDb = {
     // keyed by the provider-native id for both columns. The ON CONFLICT path
     // covers legacy rows that predate the provider_session_id mapping.
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, isArchived, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, custom_name_source, project_path, jsonl_path, isArchived, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'provider', ?, ?, 0, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP))
        ON CONFLICT(session_id) DO UPDATE SET
          provider = excluded.provider,
          provider_session_id = excluded.provider_session_id,
@@ -148,6 +158,7 @@ export const sessionsDb = {
          jsonl_path = excluded.jsonl_path,
          isArchived = CASE WHEN ? IS NULL OR julianday(excluded.updated_at) > julianday(sessions.updated_at) THEN 0 ELSE sessions.isArchived END,
          custom_name = CASE
+           WHEN sessions.custom_name_source = 'user' THEN sessions.custom_name
            WHEN sessions.session_id <> sessions.provider_session_id AND sessions.custom_name IS NOT NULL
              THEN sessions.custom_name
            ELSE COALESCE(excluded.custom_name, sessions.custom_name)
@@ -440,13 +451,87 @@ export const sessionsDb = {
     ).run(effort, sessionId);
   },
 
+  /**
+   * Provider synchronizers may refresh automatic names without replacing an
+   * explicit sidebar override or guessing the source of a legacy NULL name.
+   */
   updateSessionCustomName(sessionId: string, customName: string): void {
     const db = getConnection();
     db.prepare(
       `UPDATE sessions
        SET custom_name = ?
+       WHERE session_id = ? AND custom_name_source IS NOT 'user'`
+    ).run(customName, sessionId);
+  },
+
+  /** The Providers sidebar rename service records the override atomically. */
+  renameSessionCustomName(sessionId: string, customName: string): void {
+    getConnection().prepare(
+      `UPDATE sessions
+       SET custom_name = ?, custom_name_source = 'user'
        WHERE session_id = ?`
     ).run(customName, sessionId);
+  },
+
+  /**
+   * Codex title synchronization reads native rows in one query, including
+   * archived rows. Mapped app sessions own their names and are excluded.
+   */
+  getNativeSessionsByProvider(provider: string): SessionRow[] {
+    const rows = getConnection().prepare(
+      `SELECT ${SESSION_ROW_COLUMNS} FROM sessions
+       WHERE provider = ? AND session_id = provider_session_id`
+    ).all(provider) as SessionRow[];
+    return normalizeSessionRows(rows);
+  },
+
+  /**
+   * Codex applies index titles and legacy provenance decisions in one
+   * transaction. User overrides and app mappings are protected again at the
+   * write boundary. A legacy user classification can only keep the same
+   * name; it cannot overwrite a name changed since the caller read it.
+   * Returns ids with changed display names, excluding source-only updates.
+   * Archive state and activity timestamps are never changed here.
+   */
+  applyNativeProviderSessionNames(provider: string, updates: NativeProviderSessionNameUpdate[]): string[] {
+    const db = getConnection();
+    return db.transaction(() => {
+      const rows = db.prepare(
+        `SELECT ${SESSION_ROW_COLUMNS} FROM sessions
+         WHERE provider = ? AND session_id = provider_session_id`
+      ).all(provider) as SessionRow[];
+      const currentById = new Map(rows.map((row) => [row.session_id, row]));
+      const updateName = db.prepare(
+        `UPDATE sessions SET custom_name = ?, custom_name_source = ?
+         WHERE session_id = ? AND provider = ?
+           AND session_id = provider_session_id
+           AND custom_name_source IS NOT 'user'`
+      );
+      const changedSessionIds = new Set<string>();
+
+      for (const update of updates) {
+        const current = currentById.get(update.sessionId);
+        if (!current || current.custom_name_source === 'user') {
+          continue;
+        }
+        if (update.source === 'user'
+          && (current.custom_name_source !== null || current.custom_name !== update.customName)) {
+          continue;
+        }
+        if (current.custom_name === update.customName && current.custom_name_source === update.source) {
+          continue;
+        }
+
+        updateName.run(update.customName, update.source, update.sessionId, provider);
+        if (current.custom_name !== update.customName) {
+          changedSessionIds.add(update.sessionId);
+        }
+        current.custom_name = update.customName;
+        current.custom_name_source = update.source;
+      }
+
+      return [...changedSessionIds];
+    })();
   },
 
   getSessionById(sessionId: string): SessionRow | null {
