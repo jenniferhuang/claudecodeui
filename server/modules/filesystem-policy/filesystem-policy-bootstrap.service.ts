@@ -8,6 +8,8 @@ type BootstrapOptions = {
   environment?: NodeJS.ProcessEnv;
   homeDirectory?: string;
   platform?: NodeJS.Platform;
+  /** Injectable OS discovery result for isolated bootstrap tests. */
+  darwinUserCacheDirectory?: string;
   launch?: (profilePath: string, environment: NodeJS.ProcessEnv) => void | Promise<void>;
 };
 
@@ -97,7 +99,22 @@ function parseConfiguration(contents: string, homeDirectory: string) {
   return { writableRoots, runtimeDirectory };
 }
 
-function operationalWritePaths(homeDirectory: string, environment: NodeJS.ProcessEnv, writableRoots: string[]) {
+function discoverDarwinUserCacheDirectory(): string {
+  const result = spawnSync('/usr/bin/getconf', ['DARWIN_USER_CACHE_DIR'], {
+    encoding: 'utf8', timeout: 3_000, maxBuffer: 4_096,
+  });
+  if (result.error || result.status !== 0) {
+    throw new Error('Unable to discover the macOS user cache directory');
+  }
+  return result.stdout.trim();
+}
+
+function operationalWritePaths(
+  homeDirectory: string,
+  environment: NodeJS.ProcessEnv,
+  writableRoots: string[],
+  darwinUserCacheDirectory: string,
+) {
   const resolveStatePath = (candidate: string) => {
     const lexical = path.resolve(candidate);
     const resolved = canonicalPath(lexical);
@@ -116,6 +133,20 @@ function operationalWritePaths(homeDirectory: string, environment: NodeJS.Proces
     }
     return resolveStatePath(value ?? fallback);
   };
+  if (!darwinUserCacheDirectory || !path.isAbsolute(darwinUserCacheDirectory)
+    || darwinUserCacheDirectory.includes('\n') || darwinUserCacheDirectory.includes('\0')
+    || path.resolve(darwinUserCacheDirectory) === path.parse(darwinUserCacheDirectory).root) {
+    throw new Error('macOS user cache directory must be an absolute path below the filesystem root');
+  }
+  // getconf uses /var on macOS. Normalize only this OS alias before applying
+  // the ordinary state-path check; resolving the whole cache first could hide
+  // a user-controlled cache or MDS symlink into a review-only directory.
+  const requestedCache = path.resolve(darwinUserCacheDirectory);
+  const normalizedCache = requestedCache === '/var' || requestedCache.startsWith('/var/')
+    ? path.join(fs.realpathSync('/var'), path.relative('/var', requestedCache))
+    : requestedCache;
+  const userCache = resolveStatePath(normalizedCache);
+  const mdsDirectory = resolveStatePath(path.join(userCache, 'mds'));
   const claudeHome = providerHome('CLAUDE_CONFIG_DIR', path.join(homeDirectory, '.claude'));
   const credentialHome = providerHome('CLAUDE_SECURESTORAGE_CONFIG_DIR', claudeHome);
   const codexHome = providerHome('CODEX_HOME', path.join(homeDirectory, '.codex'));
@@ -138,6 +169,12 @@ function operationalWritePaths(homeDirectory: string, environment: NodeJS.Proces
     path.join(openCodeDataHome, 'opencode'),
   ].map(resolveStatePath);
   const files = [
+    // Secure Transport opens the per-user MDS lock read/write and can rebuild
+    // its two security-module databases. Apple's safeCopyFile uses exactly
+    // the trailing-underscore staging names before rename. Keep all other
+    // OS cache data and the MDS directory itself read-only.
+    ...['mds.lock', 'mdsObject.db', 'mdsDirectory.db', 'mdsObject.db_', 'mdsDirectory.db_']
+      .map((entry) => path.join(mdsDirectory, entry)),
     ...['.cloudcli/auth.db', '.cloudcli/local-server.json', '.cloudcli/server.log',
       '.cloudcli/launchd.stdout.log', '.cloudcli/launchd.stderr.log', '.claude-code-ui/plugins.json',
     ].map((entry) => path.join(homeDirectory, entry)),
@@ -267,7 +304,10 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
   if ((options.platform ?? process.platform) !== 'darwin') {
     throw new Error('Configured CloudCLI filesystem policy requires macOS sandbox-exec; refusing an unprotected start');
   }
-  const operational = operationalWritePaths(homeDirectory, environment, writableRoots);
+  const operational = operationalWritePaths(
+    homeDirectory, environment, writableRoots,
+    options.darwinUserCacheDirectory ?? discoverDarwinUserCacheDirectory(),
+  );
   const protectedConfigPaths = [...new Set([path.resolve(requestedPath), ...entrypoints.symlinks, entrypoints.finalEntry, configPath])];
   // Hash the actual policy semantics, excluding only its own not-yet-known
   // filename. Distinct runtime/DB grants must not overwrite another service's
