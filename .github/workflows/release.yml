@@ -21,6 +21,7 @@ permissions:
 # visible for maintenance context.
 jobs:
   release:
+    if: github.repository == 'siteboon/claudecodeui'
     runs-on: ubuntu-latest
     permissions:
       contents: write
