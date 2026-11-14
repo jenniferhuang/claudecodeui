@@ -8,16 +8,17 @@ import { pathToFileURL } from 'node:url';
 
 import { initializeFilesystemPolicy } from '../index.js';
 
-function createFixture() {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudcli.policy-bootstrap-'));
+function createFixture(temporaryRoot = os.tmpdir()) {
+  const directory = fs.mkdtempSync(path.join(temporaryRoot, 'cloudcli.policy-bootstrap-'));
   const homeDirectory = fs.realpathSync(directory);
   const configPath = path.join(homeDirectory, '.config', 'cloudcli', 'filesystem-policy.json');
   const first = path.join(homeDirectory, 'projects', 'first edit');
   const second = path.join(homeDirectory, '.second');
   const review = path.join(homeDirectory, 'review');
+  const userCacheDirectory = path.join(homeDirectory, 'os-cache');
   for (const root of [path.dirname(configPath), first, second, review]) fs.mkdirSync(root, { recursive: true });
   return {
-    homeDirectory, configPath, first, second, review,
+    homeDirectory, configPath, first, second, review, userCacheDirectory,
     writeConfig(value: unknown = { version: 1, writableRoots: [first, second] }) {
       fs.writeFileSync(configPath, JSON.stringify(value));
     },
@@ -31,7 +32,7 @@ test('missing optional default policy leaves the server environment and filesyst
   const environment = { EXISTING_SETTING: 'unchanged' };
   let launched = false;
   await initializeFilesystemPolicy({
-    environment, homeDirectory: fixture.homeDirectory, platform: 'linux',
+    environment, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'linux',
     launch: () => { launched = true; },
   });
   assert.equal(launched, false);
@@ -42,7 +43,7 @@ test('missing optional default policy leaves the server environment and filesyst
 test('explicitly missing, malformed and unsupported policies fail closed', async (t) => {
   const fixture = createFixture();
   t.after(() => fixture.cleanup());
-  const options = { homeDirectory: fixture.homeDirectory, platform: 'darwin' as const, launch: () => { throw new Error('must not launch'); } };
+  const options = { homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin' as const, launch: () => { throw new Error('must not launch'); } };
   await assert.rejects(initializeFilesystemPolicy({ ...options, environment: { CLOUDCLI_FILESYSTEM_POLICY: '/missing/cloudcli-policy.json' } }), /Unable to load/);
   await assert.rejects(initializeFilesystemPolicy({ ...options, environment: { CLOUDCLI_FILESYSTEM_POLICY: 'relative.json' } }), /absolute/);
   for (const [config, expected] of [
@@ -71,7 +72,7 @@ test('canonical roots and runtime paths are passed to the replacement without ch
   const environment = { DATABASE_PATH: path.join(fixture.homeDirectory, 'explicit-auth.db') };
   let capture: { profilePath: string; environment: NodeJS.ProcessEnv } | undefined;
   await initializeFilesystemPolicy({
-    environment, homeDirectory: fixture.homeDirectory, platform: 'darwin',
+    environment, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin',
     launch: (profilePath, childEnvironment) => { capture = { profilePath, environment: childEnvironment }; },
   });
   assert.ok(capture);
@@ -102,12 +103,12 @@ test('policy data cannot live inside writable project or operational locations',
   fs.writeFileSync(config, JSON.stringify({ version: 1, writableRoots: [fixture.first, fixture.second] }));
   await assert.rejects(initializeFilesystemPolicy({
     environment: { CLOUDCLI_FILESYSTEM_POLICY: config },
-    homeDirectory: fixture.homeDirectory, platform: 'darwin', launch: () => undefined,
+    homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch: () => undefined,
   }), /outside writable/);
   fixture.writeConfig();
   await assert.rejects(initializeFilesystemPolicy({
     environment: { CLOUDCLI_PROCESS_SANDBOX: '1', CLOUDCLI_SANDBOX_PROFILE: '/different/profile.sb' },
-    homeDirectory: fixture.homeDirectory, platform: 'darwin', launch: () => undefined,
+    homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch: () => undefined,
   }), /does not match/);
 });
 
@@ -134,7 +135,7 @@ test('an editable policy symlink or editable parent alias cannot select the next
     path.join(relativeTargetChain, path.basename(fixture.configPath)),
   ]) {
     await assert.rejects(initializeFilesystemPolicy({
-      environment: { CLOUDCLI_FILESYSTEM_POLICY: entry }, homeDirectory: fixture.homeDirectory,
+      environment: { CLOUDCLI_FILESYSTEM_POLICY: entry }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
       platform: 'darwin', launch: () => { launches += 1; },
     }), /outside writable/);
   }
@@ -144,7 +145,7 @@ test('an editable policy symlink or editable parent alias cannot select the next
   fs.symlinkSync(fixture.configPath, safeLink);
   let capture: { profilePath: string; environment: NodeJS.ProcessEnv } | undefined;
   await initializeFilesystemPolicy({
-    environment: { CLOUDCLI_FILESYSTEM_POLICY: safeLink }, homeDirectory: fixture.homeDirectory,
+    environment: { CLOUDCLI_FILESYSTEM_POLICY: safeLink }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
     platform: 'darwin', launch: (profilePath, environment) => { capture = { profilePath, environment }; },
   });
   assert.ok(capture);
@@ -162,7 +163,7 @@ test('relative policy links resolve parent segments physically and cyclic links 
   fs.symlinkSync(path.relative(safeDirectory, fixture.configPath), safeAlias);
   let launches = 0;
   await assert.doesNotReject(initializeFilesystemPolicy({
-    environment: { CLOUDCLI_FILESYSTEM_POLICY: safeAlias }, homeDirectory: fixture.homeDirectory,
+    environment: { CLOUDCLI_FILESYSTEM_POLICY: safeAlias }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
     platform: 'darwin', launch: () => { launches += 1; },
   }));
   const loopA = path.join(safeDirectory, 'loop-a');
@@ -170,7 +171,7 @@ test('relative policy links resolve parent segments physically and cyclic links 
   fs.symlinkSync('loop-b', loopA);
   fs.symlinkSync('loop-a', loopB);
   await assert.rejects(initializeFilesystemPolicy({
-    environment: { CLOUDCLI_FILESYSTEM_POLICY: loopA }, homeDirectory: fixture.homeDirectory,
+    environment: { CLOUDCLI_FILESYSTEM_POLICY: loopA }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
     platform: 'darwin', launch: () => { launches += 1; },
   }), /Too many symbolic links/);
   assert.equal(launches, 1);
@@ -181,12 +182,12 @@ test('runtime filename exceptions cannot serve as mutable policy selectors', asy
   t.after(() => fixture.cleanup());
   fixture.writeConfig();
   let launches = 0;
-  for (const relative of ['.cloudcli/claude-shell-theme-light.json', '.codex/state_5.sqlite']) {
+  for (const relative of ['.cloudcli/claude-shell-theme-light.json', '.codex/state_5.sqlite', '.codex/installation_id']) {
     const alias = path.join(fixture.homeDirectory, relative);
     fs.mkdirSync(path.dirname(alias), { recursive: true });
     fs.symlinkSync(fixture.configPath, alias);
     await assert.rejects(initializeFilesystemPolicy({
-      environment: { CLOUDCLI_FILESYSTEM_POLICY: alias }, homeDirectory: fixture.homeDirectory,
+      environment: { CLOUDCLI_FILESYSTEM_POLICY: alias }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
       platform: 'darwin', launch: () => { launches += 1; },
     }), /outside writable/);
   }
@@ -201,17 +202,17 @@ test('services sharing a JSON policy keep distinct profiles for distinct databas
   const launch = (profilePath: string, environment: NodeJS.ProcessEnv) => { captures.push({ profilePath, environment }); };
   await initializeFilesystemPolicy({
     environment: { DATABASE_PATH: path.join(fixture.homeDirectory, 'first-auth.db') },
-    homeDirectory: fixture.homeDirectory, platform: 'darwin', launch,
+    homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch,
   });
   const firstProfile = fs.readFileSync(captures[0].profilePath, 'utf8');
   await initializeFilesystemPolicy({
     environment: { DATABASE_PATH: path.join(fixture.homeDirectory, 'second-auth.db') },
-    homeDirectory: fixture.homeDirectory, platform: 'darwin', launch,
+    homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch,
   });
   assert.notEqual(captures[0].profilePath, captures[1].profilePath);
   assert.equal(fs.readFileSync(captures[0].profilePath, 'utf8'), firstProfile);
   await assert.rejects(initializeFilesystemPolicy({
-    environment: captures[0].environment, homeDirectory: fixture.homeDirectory, platform: 'darwin',
+    environment: captures[0].environment, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin',
   }), /marker is set/); // Content attestation succeeds; this test parent is intentionally not sandboxed.
 });
 
@@ -224,12 +225,12 @@ test('state symlinks cannot grant writes to an otherwise review-only location on
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     fs.symlinkSync(fixture.review, statePath);
     await assert.rejects(initializeFilesystemPolicy({
-      environment: {}, homeDirectory: fixture.homeDirectory, platform: 'darwin', launch: () => undefined,
+      environment: {}, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch: () => undefined,
     }), /state path resolves through a symlink/);
     fs.unlinkSync(statePath);
     fs.symlinkSync(fixture.first, statePath);
     await assert.doesNotReject(initializeFilesystemPolicy({
-      environment: {}, homeDirectory: fixture.homeDirectory, platform: 'darwin', launch: () => undefined,
+      environment: {}, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch: () => undefined,
     }));
   }
 });
@@ -240,19 +241,19 @@ test('auth and database symlinks cannot turn an unrelated document into writable
   fixture.writeConfig();
   const document = path.join(fixture.review, 'invoice.txt');
   fs.writeFileSync(document, 'review only');
-  for (const stateFile of ['.cloudcli/auth.db', '.codex/auth.json']) {
+  for (const stateFile of ['.cloudcli/auth.db', '.codex/auth.json', '.codex/installation_id']) {
     const statePath = path.join(fixture.homeDirectory, stateFile);
     fs.mkdirSync(path.dirname(statePath), { recursive: true });
     fs.symlinkSync(document, statePath);
     await assert.rejects(initializeFilesystemPolicy({
-      environment: {}, homeDirectory: fixture.homeDirectory, platform: 'darwin', launch: () => undefined,
+      environment: {}, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin', launch: () => undefined,
     }), /state path resolves through a symlink/);
     fs.unlinkSync(statePath);
   }
   const databaseAlias = path.join(fixture.homeDirectory, 'configured-db');
   fs.symlinkSync(document, databaseAlias);
   await assert.rejects(initializeFilesystemPolicy({
-    environment: { DATABASE_PATH: databaseAlias }, homeDirectory: fixture.homeDirectory,
+    environment: { DATABASE_PATH: databaseAlias }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
     platform: 'darwin', launch: () => undefined,
   }), /state path resolves through a symlink/);
   assert.equal(fs.readFileSync(document, 'utf8'), 'review only');
@@ -270,7 +271,7 @@ test('native macOS policy and inherited bootstrap permit edits only in project a
   fs.symlinkSync(fixture.configPath, safePolicyAlias);
   let capture: { profilePath: string; environment: NodeJS.ProcessEnv } | undefined;
   await initializeFilesystemPolicy({
-    environment: { ...process.env, CLOUDCLI_FILESYSTEM_POLICY: safePolicyAlias }, homeDirectory: fixture.homeDirectory,
+    environment: { ...process.env, CLOUDCLI_FILESYSTEM_POLICY: safePolicyAlias }, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
     launch: (profilePath, environment) => { capture = { profilePath, environment }; },
   });
   assert.ok(capture);
@@ -309,13 +310,13 @@ test('native macOS policy and inherited bootstrap permit edits only in project a
     '-f', capture.profilePath, process.execPath,
     '--import', path.resolve('node_modules/tsx/dist/esm/index.mjs'),
     '--input-type=module', '-e',
-    `import { initializeFilesystemPolicy } from ${JSON.stringify(moduleUrl)}; await initializeFilesystemPolicy({ homeDirectory: ${JSON.stringify(fixture.homeDirectory)} }); console.log('inherited bootstrap passed');`,
+    `import { initializeFilesystemPolicy } from ${JSON.stringify(moduleUrl)}; await initializeFilesystemPolicy({ homeDirectory: ${JSON.stringify(fixture.homeDirectory)}, darwinUserCacheDirectory: ${JSON.stringify(fixture.userCacheDirectory)} }); console.log('inherited bootstrap passed');`,
   ], { encoding: 'utf8', env: capture.environment, timeout: 15_000 });
   assert.equal(inherited.status, 0, inherited.stderr || inherited.stdout);
   assert.match(inherited.stdout, /inherited bootstrap passed/);
 
   await assert.rejects(initializeFilesystemPolicy({
-    environment: capture.environment, homeDirectory: fixture.homeDirectory,
+    environment: capture.environment, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory,
   }), /marker is set/);
 });
 
@@ -327,7 +328,7 @@ async function captureProviderPolicy(fixture: ReturnType<typeof createFixture>, 
       CLAUDE_CONFIG_DIR: undefined, CLAUDE_SECURESTORAGE_CONFIG_DIR: undefined,
       CODEX_HOME: undefined, XDG_DATA_HOME: undefined, ...overrides,
     },
-    homeDirectory: fixture.homeDirectory, platform: 'darwin',
+    homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin',
     launch: (profilePath, environment) => { capture = { profilePath, environment }; },
   });
   assert.ok(capture);
@@ -338,7 +339,7 @@ for (const scenario of [
   { name: 'default Claude file credential refresh', key: null, root: '.claude', writable: ['.credentials.json', '.config.json', 'backups/.claude.json.backup.12345'], denied: ['settings.json', '.credentials.json.tmp.not-refresh', '.credentials.json.tmp.1234567', '.credentials.json.tmp.123456789', '.credentials.json.tmp.1234abcd.extra', '.config.json.tmp.123.123456abcde', '.config.json.tmp.123.123456abcdef.extra', '.oauth_refresh.lock.owner.tmp.not-refresh', 'unrelated-project/note.txt'] },
   { name: 'CLAUDE_CONFIG_DIR runtime state', key: 'CLAUDE_CONFIG_DIR', root: 'custom-claude', writable: ['.credentials.json', '.claude.json', '.config.json', 'projects/example/session.jsonl', 'backups/.config.json.corrupted.12345'], denied: ['settings.json', '.credentials.json.tmp.not-refresh', '.claude.json.unrelated/note.txt', 'unrelated-project/note.txt'] },
   { name: 'CLAUDE_SECURESTORAGE_CONFIG_DIR credential state', key: 'CLAUDE_SECURESTORAGE_CONFIG_DIR', root: 'custom-credentials', writable: ['.credentials.json'], denied: ['settings.json', 'projects/session.jsonl', 'unrelated-project/note.txt'] },
-  { name: 'CODEX_HOME runtime state', key: 'CODEX_HOME', root: 'custom-codex', writable: ['auth.json', 'sessions/session.jsonl', 'state_5.sqlite'], denied: ['config.toml', 'unrelated-project/note.txt'] },
+  { name: 'CODEX_HOME runtime state', key: 'CODEX_HOME', root: 'custom-codex', writable: ['auth.json', 'installation_id', 'sessions/session.jsonl', 'state_5.sqlite'], denied: ['config.toml', 'unrelated-project/note.txt'] },
   { name: 'XDG_DATA_HOME OpenCode state', key: 'XDG_DATA_HOME', root: 'custom-data', writable: ['opencode/auth.json', 'opencode/storage/session.json'], denied: ['unrelated-project/note.txt', 'opencode-sibling/auth.json'] },
 ] as const) {
   test(`native macOS provider state permits ${scenario.name} while unrelated files stay read-only`, { skip: process.platform !== 'darwin' }, async (t) => {
@@ -399,7 +400,7 @@ for (const scenario of [
     const inherited = spawnSync('/usr/bin/sandbox-exec', [
       '-f', capture.profilePath, process.execPath,
       '--import', path.resolve('node_modules/tsx/dist/esm/index.mjs'), '--input-type=module', '-e',
-      `import { initializeFilesystemPolicy } from ${JSON.stringify(moduleUrl)}; await initializeFilesystemPolicy({ homeDirectory: ${JSON.stringify(fixture.homeDirectory)} }); console.log('provider inherited bootstrap passed');`,
+      `import { initializeFilesystemPolicy } from ${JSON.stringify(moduleUrl)}; await initializeFilesystemPolicy({ homeDirectory: ${JSON.stringify(fixture.homeDirectory)}, darwinUserCacheDirectory: ${JSON.stringify(fixture.userCacheDirectory)} }); console.log('provider inherited bootstrap passed');`,
     ], { encoding: 'utf8', env: capture.environment, timeout: 15_000 });
     assert.equal(inherited.status, 0, inherited.stderr || inherited.stdout);
     assert.match(inherited.stdout, /provider inherited bootstrap passed/);
@@ -469,10 +470,147 @@ test('without a policy provider state selectors retain their existing behavior',
     CLAUDE_CONFIG_DIR: 'relative-claude', CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
     CODEX_HOME: 'relative-codex', XDG_DATA_HOME: 'relative-data',
   };
-  await initializeFilesystemPolicy({ environment, homeDirectory: fixture.homeDirectory, platform: 'linux' });
+  await initializeFilesystemPolicy({ environment, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'linux' });
   assert.deepEqual(environment, {
     CLAUDE_CONFIG_DIR: 'relative-claude', CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
     CODEX_HOME: 'relative-codex', XDG_DATA_HOME: 'relative-data',
   });
   assert.equal(fs.existsSync(path.join(fixture.homeDirectory, '.cloudcli')), false);
+});
+
+for (const scenario of [
+  { name: 'default Codex home', directory: '.codex', custom: false },
+  { name: 'configured CODEX_HOME', directory: 'custom-codex', custom: true },
+]) {
+  test(`native macOS policy lets ${scenario.name} refresh its installation identity marker`, { skip: process.platform !== 'darwin' }, async (t) => {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    fixture.writeConfig();
+    const codexDirectory = path.join(fixture.homeDirectory, scenario.directory);
+    fs.mkdirSync(codexDirectory);
+    const installationId = path.join(codexDirectory, 'installation_id');
+    fs.writeFileSync(installationId, 'existing-installation');
+    const capture = await captureProviderPolicy(fixture, scenario.custom ? { CODEX_HOME: codexDirectory } : {});
+    const script = `
+      const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
+      const installationId = process.argv[1];
+      const descriptor = fs.openSync(installationId, 'r+');
+      try { fs.futimesSync(descriptor, 1_700_000_000, 1_700_000_000); }
+      finally { fs.closeSync(descriptor); }
+      assert.equal(fs.readFileSync(installationId, 'utf8'), 'existing-installation');
+      assert.equal(fs.statSync(installationId).mtimeMs, 1_700_000_000_000);
+      assert.throws(() => fs.writeFileSync(path.join(path.dirname(installationId), 'unrelated-marker'), 'blocked'), /EPERM|EACCES/);
+      console.log('installation identity refresh passed');
+    `;
+    const native = spawnSync('/usr/bin/sandbox-exec', [
+      '-f', capture.profilePath, process.execPath, '-e', script, installationId,
+    ], { encoding: 'utf8', env: capture.environment, timeout: 15_000 });
+    assert.equal(native.status, 0, native.stderr || native.stdout);
+    assert.match(native.stdout, /installation identity refresh passed/);
+    assert.equal(fs.existsSync(path.join(codexDirectory, 'unrelated-marker')), false);
+  });
+}
+
+test('native macOS policy permits exact Secure Transport MDS cache refresh while siblings stay read-only', { skip: process.platform !== 'darwin' }, async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  const mdsDirectory = path.join(fixture.userCacheDirectory, 'mds');
+  fs.mkdirSync(mdsDirectory, { recursive: true });
+  for (const name of ['mds.lock', 'mdsObject.db', 'mdsDirectory.db']) fs.writeFileSync(path.join(mdsDirectory, name), 'existing cache');
+  const sibling = path.join(fixture.userCacheDirectory, 'other-cache.txt');
+  fs.writeFileSync(sibling, 'unchanged');
+  const capture = await captureProviderPolicy(fixture);
+  const script = `
+    const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
+    const mdsDirectory = process.argv[1], sibling = process.argv[2];
+    const lock = fs.openSync(path.join(mdsDirectory, 'mds.lock'), 'r+');
+    try { fs.futimesSync(lock, 1_700_000_000, 1_700_000_000); }
+    finally { fs.closeSync(lock); }
+    for (const name of ['mdsObject.db', 'mdsDirectory.db']) {
+      const database = path.join(mdsDirectory, name), staging = database + '_';
+      fs.unlinkSync(database);
+      fs.writeFileSync(staging, 'rebuilt security module cache', { flag: 'wx', mode: 0o600 });
+      fs.renameSync(staging, database);
+      assert.equal(fs.readFileSync(database, 'utf8'), 'rebuilt security module cache');
+    }
+    for (const target of [sibling, path.join(mdsDirectory, 'unrelated.txt'), path.join(mdsDirectory, 'mdsObject.db-journal'), path.join(mdsDirectory, 'mdsObject.db__')]) {
+      assert.throws(() => fs.writeFileSync(target, 'changed'), /EPERM|EACCES/);
+    }
+    assert.throws(() => fs.chmodSync(mdsDirectory, 0o777), /EPERM|EACCES/);
+    console.log('native MDS cache refresh passed');
+  `;
+  const native = spawnSync('/usr/bin/sandbox-exec', [
+    '-f', capture.profilePath, process.execPath, '-e', script, mdsDirectory, sibling,
+  ], { encoding: 'utf8', env: capture.environment, timeout: 15_000 });
+  assert.equal(native.status, 0, native.stderr || native.stdout);
+  assert.match(native.stdout, /native MDS cache refresh passed/);
+  assert.equal(fs.readFileSync(sibling, 'utf8'), 'unchanged');
+});
+
+test('MDS cache parents are created before sandboxing without granting their directories', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  assert.equal(fs.existsSync(fixture.userCacheDirectory), false);
+  const capture = await captureProviderPolicy(fixture);
+  const mdsDirectory = path.join(fixture.userCacheDirectory, 'mds');
+  assert.equal(fs.statSync(mdsDirectory).isDirectory(), true);
+  const profile = fs.readFileSync(capture.profilePath, 'utf8');
+  assert.equal(profile.includes(`(subpath ${JSON.stringify(mdsDirectory)})`), false);
+  assert.equal(profile.includes(`(literal ${JSON.stringify(mdsDirectory)})`), false);
+});
+
+test('MDS cache symlinks cannot redirect system state grants into review-only locations', async (t) => {
+  for (const relative of ['', 'mds', 'mds/mds.lock', 'mds/mdsObject.db', 'mds/mdsDirectory.db', 'mds/mdsObject.db_', 'mds/mdsDirectory.db_']) {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    fixture.writeConfig();
+    const alias = path.join(fixture.userCacheDirectory, relative);
+    fs.mkdirSync(path.dirname(alias), { recursive: true });
+    const file = relative.includes('mds/');
+    const target = file ? path.join(fixture.review, 'review.txt') : fixture.review;
+    if (file) fs.writeFileSync(target, 'unchanged');
+    fs.symlinkSync(target, alias);
+    await assert.rejects(captureProviderPolicy(fixture), /state path resolves through a symlink/);
+  }
+});
+
+test('MDS cache files and staging names cannot select writable filesystem policies', async (t) => {
+  for (const name of ['mds.lock', 'mdsObject.db', 'mdsDirectory.db', 'mdsObject.db_', 'mdsDirectory.db_']) {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    const policy = path.join(fixture.userCacheDirectory, 'mds', name);
+    fs.mkdirSync(path.dirname(policy), { recursive: true });
+    fs.writeFileSync(policy, JSON.stringify({ version: 1, writableRoots: [fixture.first, fixture.second] }));
+    await assert.rejects(captureProviderPolicy(fixture, { CLOUDCLI_FILESYSTEM_POLICY: policy }), /outside writable/);
+  }
+});
+
+test('MDS cache discovery rejects empty, relative and filesystem-root paths', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  for (const darwinUserCacheDirectory of ['', 'relative-cache', '/']) {
+    await assert.rejects(initializeFilesystemPolicy({
+      environment: {}, homeDirectory: fixture.homeDirectory, darwinUserCacheDirectory,
+      platform: 'darwin', launch: () => undefined,
+    }), /cache directory must be an absolute path below the filesystem root/);
+  }
+});
+
+test('macOS /var cache alias normalizes without accepting additional cache symlinks', { skip: process.platform !== 'darwin' }, async (t) => {
+  const fixture = createFixture('/var/tmp');
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  assert.ok(fixture.userCacheDirectory.startsWith('/private/var/'));
+  let capture: string | undefined;
+  await initializeFilesystemPolicy({
+    environment: {}, homeDirectory: fixture.homeDirectory,
+    darwinUserCacheDirectory: fixture.userCacheDirectory.replace('/private/var/', '/var/'),
+    platform: 'darwin', launch: (profilePath) => { capture = profilePath; },
+  });
+  assert.ok(capture);
+  const profile = fs.readFileSync(capture, 'utf8');
+  assert.ok(profile.includes(`(literal ${JSON.stringify(path.join(fixture.userCacheDirectory, 'mds', 'mds.lock'))})`));
 });

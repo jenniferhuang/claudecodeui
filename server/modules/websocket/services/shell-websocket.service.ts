@@ -7,7 +7,7 @@ import { WebSocket, type RawData } from 'ws';
 
 import { parseIncomingJsonObject, stripAnsiSequences } from '@/shared/index.js';
 
-import { hasOpenCodexThreadLock, inspectOwnedCodexShellThread } from './codex-shell-identity.service.js';
+import { hasHeldCodexThreadLock, inspectOwnedCodexShellThread } from './codex-shell-identity.service.js';
 
 type ShellIncomingMessage = {
   type?: string;
@@ -82,9 +82,9 @@ export async function refreshCodexShellSessionOwnership(
   const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
   if (SAFE_SESSION_ID_PATTERN.test(providerSessionId)
     && fs.existsSync(path.join(codexHome, 'thread-writer-locks', `${providerSessionId}.lock`))) {
-    const writerOpen = await hasOpenCodexThreadLock(providerSessionId, codexHome);
-    if (writerOpen) return 'writer-held';
-    if (writerOpen === undefined) return 'unknown';
+    const writerHeld = await hasHeldCodexThreadLock(providerSessionId, codexHome);
+    if (writerHeld) return 'writer-held';
+    if (writerHeld === undefined) return 'unknown';
   }
   return results.includes('unknown') ? 'unknown' : 'ready';
 }
@@ -717,7 +717,7 @@ export function handleShellConnection(
           }
           if (ownership === 'writer-held') {
             ws.send(JSON.stringify({ type: 'error', code: 'CHAT_SESSION_ACTIVE', retryable: true,
-              message: 'Codex is still releasing this thread. Wait for its writer to exit, then reconnect.' }));
+              message: "Another Codex process holds this thread's writer lock, even if its last turn has finished. Release the thread in the owning app or exit that Codex session, then reconnect." }));
             return;
           }
           if (hasActiveCodexShellSession(sessionId ?? '', resumeSessionId)) {

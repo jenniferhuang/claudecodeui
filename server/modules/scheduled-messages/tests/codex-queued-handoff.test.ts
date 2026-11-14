@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, open, rm } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter, once } from 'node:events';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -208,16 +208,27 @@ test('a fresh Chat keeps its later native identity reserved through cleanup and 
   });
 });
 
-test('a residual native writer preserves only its queued turn until the exact FD closes', {
+test('a held native writer preserves only its queued turn until its flock releases', {
   skip: !['darwin', 'linux'].includes(process.platform) ||
-    Boolean(spawnSync(process.platform === 'darwin' ? '/usr/sbin/lsof' : 'lsof', ['-v'], { stdio: 'ignore' }).error),
+    spawnSync(process.platform === 'darwin' ? '/usr/bin/perl' : 'perl', ['-MFcntl=:flock', '-e', 'exit 0'], { timeout: 1000 }).status !== 0,
 }, async () => {
   await withDatabase(async (userId, directory) => {
     const previousCodexHome = process.env.CODEX_HOME;
     const codexHome = path.join(directory, 'codex-home');
     const lockDirectory = path.join(codexHome, 'thread-writer-locks');
     await mkdir(lockDirectory, { recursive: true });
-    const heldLock = await open(path.join(lockDirectory, 'codex-native-queue.lock'), 'w');
+    const child = spawn(process.platform === 'darwin' ? '/usr/bin/perl' : 'perl', ['-e', `
+      use Fcntl qw(O_RDWR O_CREAT LOCK_EX LOCK_UN);
+      sysopen(my $lock, $ARGV[0], O_RDWR | O_CREAT, 0600) or die "open: $!";
+      flock($lock, LOCK_EX) or die "flock: $!";
+      $| = 1; print "ready\n";
+      scalar <STDIN>;
+      flock($lock, LOCK_UN) or die "unlock: $!";
+      print "released\n";
+      scalar <STDIN>;
+    `, path.join(lockDirectory, 'codex-native-queue.lock')], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const exited = once(child, 'exit');
+    await once(child.stdout, 'data');
     process.env.CODEX_HOME = codexHome;
     sessionsDb.createAppSession('unrelated-native-writer', 'codex', directory);
     sessionsDb.assignProviderSessionId('unrelated-native-writer', 'unrelated-native');
@@ -228,7 +239,7 @@ test('a residual native writer preserves only its queued turn until the exact FD
     } as unknown as ProviderRuntimeGateway;
     try {
       const refused = await runDetachedChatTurn({ sessionId: 'codex-queue', userId, content: 'premature' }, { runtime });
-      assert.equal(refused.started, false, 'a positive native writer FD must defer this target');
+      assert.equal(refused.started, false, 'a held native writer flock must defer this target');
       assert.equal(refused.retryable, true);
       for (const sessionId of ['codex-queue', 'unrelated-native-writer']) {
         sessionDraftsDb.saveDraft(userId, sessionId, { text: '', queuedMessage: { content: sessionId } });
@@ -236,12 +247,15 @@ test('a residual native writer preserves only its queued turn until the exact FD
       assert.equal(await dispatchQueuedMessages(runtime), 1);
       assert.deepEqual(calls, ['unrelated-native-writer']);
       assert.equal(sessionDraftsDb.listQueuedMessages('codex-queue').length, 1);
-      await heldLock.close();
+      const released = once(child.stdout, 'data');
+      child.stdin.write('release\n');
+      await released;
       assert.equal(await dispatchQueuedMessages(runtime), 1);
       assert.deepEqual(calls, ['unrelated-native-writer', 'codex-queue']);
       assert.equal(sessionDraftsDb.listQueuedMessages('codex-queue').length, 0);
     } finally {
-      await heldLock.close();
+      child.stdin.end();
+      await exited;
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = previousCodexHome;
     }
