@@ -318,3 +318,161 @@ test('native macOS policy and inherited bootstrap permit edits only in project a
     environment: capture.environment, homeDirectory: fixture.homeDirectory,
   }), /marker is set/);
 });
+
+async function captureProviderPolicy(fixture: ReturnType<typeof createFixture>, overrides: NodeJS.ProcessEnv = {}) {
+  let capture: { profilePath: string; environment: NodeJS.ProcessEnv } | undefined;
+  await initializeFilesystemPolicy({
+    environment: {
+      ...process.env, HOME: fixture.homeDirectory, USERPROFILE: fixture.homeDirectory,
+      CLAUDE_CONFIG_DIR: undefined, CLAUDE_SECURESTORAGE_CONFIG_DIR: undefined,
+      CODEX_HOME: undefined, XDG_DATA_HOME: undefined, ...overrides,
+    },
+    homeDirectory: fixture.homeDirectory, platform: 'darwin',
+    launch: (profilePath, environment) => { capture = { profilePath, environment }; },
+  });
+  assert.ok(capture);
+  return capture;
+}
+
+for (const scenario of [
+  { name: 'default Claude file credential refresh', key: null, root: '.claude', writable: ['.credentials.json', '.config.json', 'backups/.claude.json.backup.12345'], denied: ['settings.json', '.credentials.json.tmp.not-refresh', '.credentials.json.tmp.1234567', '.credentials.json.tmp.123456789', '.credentials.json.tmp.1234abcd.extra', '.config.json.tmp.123.123456abcde', '.config.json.tmp.123.123456abcdef.extra', '.oauth_refresh.lock.owner.tmp.not-refresh', 'unrelated-project/note.txt'] },
+  { name: 'CLAUDE_CONFIG_DIR runtime state', key: 'CLAUDE_CONFIG_DIR', root: 'custom-claude', writable: ['.credentials.json', '.claude.json', '.config.json', 'projects/example/session.jsonl', 'backups/.config.json.corrupted.12345'], denied: ['settings.json', '.credentials.json.tmp.not-refresh', '.claude.json.unrelated/note.txt', 'unrelated-project/note.txt'] },
+  { name: 'CLAUDE_SECURESTORAGE_CONFIG_DIR credential state', key: 'CLAUDE_SECURESTORAGE_CONFIG_DIR', root: 'custom-credentials', writable: ['.credentials.json'], denied: ['settings.json', 'projects/session.jsonl', 'unrelated-project/note.txt'] },
+  { name: 'CODEX_HOME runtime state', key: 'CODEX_HOME', root: 'custom-codex', writable: ['auth.json', 'sessions/session.jsonl', 'state_5.sqlite'], denied: ['config.toml', 'unrelated-project/note.txt'] },
+  { name: 'XDG_DATA_HOME OpenCode state', key: 'XDG_DATA_HOME', root: 'custom-data', writable: ['opencode/auth.json', 'opencode/storage/session.json'], denied: ['unrelated-project/note.txt', 'opencode-sibling/auth.json'] },
+] as const) {
+  test(`native macOS provider state permits ${scenario.name} while unrelated files stay read-only`, { skip: process.platform !== 'darwin' }, async (t) => {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    fixture.writeConfig();
+    const stateRoot = path.join(fixture.homeDirectory, scenario.root);
+    const denied = scenario.denied.map((entry) => path.join(stateRoot, entry));
+    if (scenario.key === null) denied.push(path.join(fixture.homeDirectory, '.claude.json.unrelated', 'note.txt'));
+    for (const file of denied) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'unchanged');
+    }
+    const overrides = scenario.key ? { [scenario.key]: stateRoot } : {};
+    const capture = await captureProviderPolicy(fixture, overrides);
+    const script = `
+      const assert = require('node:assert/strict'), fs = require('node:fs'), path = require('node:path');
+      const writable = ${JSON.stringify(scenario.writable.map((entry) => path.join(stateRoot, entry)))};
+      for (const file of writable) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, 'refreshed runtime state', { mode: 0o600 });
+        fs.chmodSync(file, 0o600);
+        assert.equal(fs.readFileSync(file, 'utf8'), 'refreshed runtime state');
+      }
+      const credentialFile = writable.find((file) => file.endsWith('/.credentials.json'));
+      if (credentialFile) {
+        const temporary = credentialFile + '.tmp.a1b2c3d4';
+        fs.writeFileSync(temporary, 'atomic credential refresh', { mode: 0o600 });
+        fs.renameSync(temporary, credentialFile);
+        const owner = path.join(path.dirname(credentialFile), '.oauth_refresh.lock.owner');
+        fs.writeFileSync(owner + '.tmp.1234abcd', 'refresh owner', { mode: 0o600 });
+        fs.renameSync(owner + '.tmp.1234abcd', owner);
+        for (const lock of [path.join(path.dirname(credentialFile), '.oauth_refresh.lock'), path.dirname(credentialFile) + '.lock']) {
+          fs.mkdirSync(lock);
+          fs.utimesSync(lock, new Date(), new Date());
+          assert.throws(() => fs.writeFileSync(path.join(lock, 'unrelated.txt'), 'changed'), /EPERM|EACCES/);
+          fs.rmdirSync(lock);
+        }
+      }
+      for (const file of writable.filter((entry) => entry.endsWith('/.config.json') || entry.endsWith('/.claude.json'))) {
+        const temporary = file + '.tmp.123.123456abcdef';
+        fs.writeFileSync(temporary, 'atomic global state', { mode: 0o600 });
+        fs.renameSync(temporary, file);
+        fs.mkdirSync(file + '.lock');
+        fs.utimesSync(file + '.lock', new Date(), new Date());
+        fs.rmdirSync(file + '.lock');
+      }
+      for (const file of ${JSON.stringify(denied)}) {
+        assert.throws(() => fs.writeFileSync(file, 'changed'), /EPERM|EACCES/);
+        assert.equal(fs.readFileSync(file, 'utf8'), 'unchanged');
+      }
+    `;
+    const native = spawnSync('/usr/bin/sandbox-exec', ['-f', capture.profilePath, process.execPath, '-e', script], {
+      encoding: 'utf8', env: capture.environment, timeout: 15_000,
+    });
+    assert.equal(native.status, 0, native.stderr || native.stdout);
+    const moduleUrl = pathToFileURL(path.resolve('server/modules/filesystem-policy/index.ts')).href;
+    const inherited = spawnSync('/usr/bin/sandbox-exec', [
+      '-f', capture.profilePath, process.execPath,
+      '--import', path.resolve('node_modules/tsx/dist/esm/index.mjs'), '--input-type=module', '-e',
+      `import { initializeFilesystemPolicy } from ${JSON.stringify(moduleUrl)}; await initializeFilesystemPolicy({ homeDirectory: ${JSON.stringify(fixture.homeDirectory)} }); console.log('provider inherited bootstrap passed');`,
+    ], { encoding: 'utf8', env: capture.environment, timeout: 15_000 });
+    assert.equal(inherited.status, 0, inherited.stderr || inherited.stdout);
+    assert.match(inherited.stdout, /provider inherited bootstrap passed/);
+  });
+}
+
+test('provider state symlinks cannot grant credential or configured-home writes into review-only locations', async (t) => {
+  for (const scenario of [
+    { key: null, relative: '.claude/.credentials.json', file: true },
+    { key: 'CLAUDE_CONFIG_DIR', relative: 'custom-claude', file: false },
+    { key: 'CODEX_HOME', relative: 'custom-codex', file: false },
+    { key: 'CLAUDE_SECURESTORAGE_CONFIG_DIR', relative: 'custom-credentials', file: false },
+    { key: 'XDG_DATA_HOME', relative: 'custom-data', file: false },
+  ] as const) {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    fixture.writeConfig();
+    const alias = path.join(fixture.homeDirectory, scenario.relative);
+    fs.mkdirSync(path.dirname(alias), { recursive: true });
+    const target = scenario.file ? path.join(fixture.review, 'invoice.txt') : fixture.review;
+    if (scenario.file) fs.writeFileSync(target, 'review only');
+    fs.symlinkSync(target, alias);
+    await assert.rejects(captureProviderPolicy(fixture, scenario.key ? { [scenario.key]: alias } : {}), /state path resolves through a symlink/);
+  }
+});
+
+test('provider state overrides cannot make their policy selector writable', async (t) => {
+  for (const scenario of [
+    { key: 'CLAUDE_CONFIG_DIR', relative: '.credentials.json' },
+    { key: 'CLAUDE_CONFIG_DIR', relative: '.credentials.json.tmp.1234abcd' },
+    { key: 'CLAUDE_CONFIG_DIR', relative: '.oauth_refresh.lock.owner' },
+    { key: 'CLAUDE_CONFIG_DIR', relative: '.oauth_refresh.lock' },
+    { key: 'CLAUDE_SECURESTORAGE_CONFIG_DIR', relative: '.credentials.json' },
+    { key: 'CODEX_HOME', relative: 'auth.json' },
+    { key: 'CODEX_HOME', relative: 'state_5.sqlite' },
+    { key: 'XDG_DATA_HOME', relative: 'opencode/policy.json' },
+  ] as const) {
+    const fixture = createFixture();
+    t.after(() => fixture.cleanup());
+    const stateRoot = path.join(fixture.homeDirectory, 'custom-state');
+    const policy = path.join(stateRoot, scenario.relative);
+    fs.mkdirSync(path.dirname(policy), { recursive: true });
+    fs.writeFileSync(policy, JSON.stringify({ version: 1, writableRoots: [fixture.first, fixture.second] }));
+    await assert.rejects(captureProviderPolicy(fixture, {
+      [scenario.key]: stateRoot, CLOUDCLI_FILESYSTEM_POLICY: policy,
+    }), /outside writable/);
+  }
+});
+
+
+test('provider state selectors must be nonempty absolute paths when a policy is configured', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  for (const key of ['CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'CODEX_HOME', 'XDG_DATA_HOME']) {
+    for (const value of ['', 'relative-state', '   ']) {
+      await assert.rejects(captureProviderPolicy(fixture, { [key]: value }), /must be a nonempty absolute path/);
+    }
+  }
+  await assert.rejects(captureProviderPolicy(fixture, { XDG_DATA_HOME: `${fixture.review} ` }), /must be a nonempty absolute path/);
+});
+
+test('without a policy provider state selectors retain their existing behavior', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  const environment = {
+    CLAUDE_CONFIG_DIR: 'relative-claude', CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
+    CODEX_HOME: 'relative-codex', XDG_DATA_HOME: 'relative-data',
+  };
+  await initializeFilesystemPolicy({ environment, homeDirectory: fixture.homeDirectory, platform: 'linux' });
+  assert.deepEqual(environment, {
+    CLAUDE_CONFIG_DIR: 'relative-claude', CLAUDE_SECURESTORAGE_CONFIG_DIR: '',
+    CODEX_HOME: 'relative-codex', XDG_DATA_HOME: 'relative-data',
+  });
+  assert.equal(fs.existsSync(path.join(fixture.homeDirectory, '.cloudcli')), false);
+});

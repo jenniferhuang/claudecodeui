@@ -62,6 +62,17 @@ the editable project roots. Temporary and cache files use a private runtime
 directory. The policy configuration and generated profile must remain outside
 editable project roots.
 
+Provider state exceptions follow `CLAUDE_CONFIG_DIR`, Claude's existing
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` credential selector, `CODEX_HOME`, and
+`XDG_DATA_HOME` (only its `opencode` child). When a policy is configured, these
+selectors must be nonempty absolute paths so a provider changing into a project
+cannot reinterpret its state location. `XDG_DATA_HOME` must also have no
+surrounding whitespace, avoiding disagreement between provider readers. Without
+a policy, their existing behavior is unchanged. State paths that resolve through symlinks outside the
+writable project roots are rejected. Credential refresh files, locks, and
+atomic temporary files are permitted without granting writes to unrelated
+settings or sibling project folders.
+
 The filesystem restriction is inherited by children and remains in force when
 an agent uses its own bypass mode. macOS does not permit applying a second
 Seatbelt sandbox inside an existing one. CloudCLI therefore makes its Codex and

@@ -106,32 +106,67 @@ function operationalWritePaths(homeDirectory: string, environment: NodeJS.Proces
     }
     return resolved;
   };
+  const providerHome = (key: string, fallback: string) => {
+    const value = environment[key];
+    // Provider children change cwd to the project. A relative selector could
+    // otherwise resolve to a different location than these startup grants.
+    if (value !== undefined && (!value || !path.isAbsolute(value)
+      || (key === 'XDG_DATA_HOME' && value !== value.trim()))) {
+      throw new Error(`${key} must be a nonempty absolute path when a filesystem policy is configured`);
+    }
+    return resolveStatePath(value ?? fallback);
+  };
+  const claudeHome = providerHome('CLAUDE_CONFIG_DIR', path.join(homeDirectory, '.claude'));
+  const credentialHome = providerHome('CLAUDE_SECURESTORAGE_CONFIG_DIR', claudeHome);
+  const codexHome = providerHome('CODEX_HOME', path.join(homeDirectory, '.codex'));
+  const openCodeDataHome = providerHome('XDG_DATA_HOME', path.join(homeDirectory, '.local', 'share'));
+  const globalClaudeConfig = path.join(environment.CLAUDE_CONFIG_DIR === undefined ? homeDirectory : claudeHome, '.claude.json');
+  const legacyClaudeConfig = path.join(claudeHome, '.config.json');
+  const claudeCredentials = path.join(credentialHome, '.credentials.json');
+  const refreshOwner = path.join(credentialHome, '.oauth_refresh.lock.owner');
+  const claudeBackups = path.join(claudeHome, 'backups');
   const directories = [
-    '.cloudcli/assets', '.cloudcli/browser-use', '.claude-code-ui/plugins',
-    '.codex/sessions', '.codex/archived_sessions', '.codex/tmp', '.codex/.tmp',
-    '.codex/log', '.codex/logs', '.codex/cache', '.codex/shell_snapshots',
-    '.codex/thread-writer-locks', '.codex/project-metadata-locks', '.codex/sqlite',
-    '.claude/projects', '.claude/statsig', '.claude/debug', '.claude/todos',
-    '.claude/tasks', '.claude/session-env', '.claude/shell-snapshots', '.claude/plans', '.claude/cache',
-    '.cursor/projects', '.cursor/chats', '.cursor/logs', '.cursor/cache', '.local/share/opencode',
-  ].map((entry) => resolveStatePath(path.join(homeDirectory, entry)));
+    ...['.cloudcli/assets', '.cloudcli/browser-use', '.claude-code-ui/plugins',
+      '.cursor/projects', '.cursor/chats', '.cursor/logs', '.cursor/cache',
+    ].map((entry) => path.join(homeDirectory, entry)),
+    ...['sessions', 'archived_sessions', 'tmp', '.tmp', 'log', 'logs', 'cache',
+      'shell_snapshots', 'thread-writer-locks', 'project-metadata-locks', 'sqlite',
+    ].map((entry) => path.join(codexHome, entry)),
+    ...['projects', 'statsig', 'debug', 'todos', 'tasks', 'session-env',
+      'shell-snapshots', 'plans', 'cache',
+    ].map((entry) => path.join(claudeHome, entry)),
+    path.join(openCodeDataHome, 'opencode'),
+  ].map(resolveStatePath);
   const files = [
-    '.cloudcli/auth.db', '.cloudcli/local-server.json', '.cloudcli/server.log',
-    '.cloudcli/launchd.stdout.log', '.cloudcli/launchd.stderr.log', '.claude-code-ui/plugins.json',
-    '.codex/auth.json', '.codex/auth.lock', '.codex/models_cache.json',
-    '.codex/history.jsonl', '.codex/session_index.jsonl', '.codex/session_index.jsonl.lock',
-    '.codex/version.json', '.codex/.sqlite-maintenance.lock', '.claude.json',
-  ].map((entry) => resolveStatePath(path.join(homeDirectory, entry)));
+    ...['.cloudcli/auth.db', '.cloudcli/local-server.json', '.cloudcli/server.log',
+      '.cloudcli/launchd.stdout.log', '.cloudcli/launchd.stderr.log', '.claude-code-ui/plugins.json',
+    ].map((entry) => path.join(homeDirectory, entry)),
+    ...['auth.json', 'auth.lock', 'models_cache.json', 'history.jsonl',
+      'session_index.jsonl', 'session_index.jsonl.lock', 'version.json', '.sqlite-maintenance.lock',
+    ].map((entry) => path.join(codexHome, entry)),
+    globalClaudeConfig, `${globalClaudeConfig}.lock`, legacyClaudeConfig, `${legacyClaudeConfig}.lock`,
+    claudeCredentials, refreshOwner,
+    // Claude's refresh locks and backups directory need their own inode
+    // operations, without granting writes to arbitrary descendants.
+    path.join(credentialHome, '.oauth_refresh.lock'), `${credentialHome}.lock`, claudeBackups,
+  ].map(resolveStatePath);
   if (environment.DATABASE_PATH) {
     const database = resolveStatePath(environment.DATABASE_PATH);
     files.push(database, `${database}-wal`, `${database}-shm`, `${database}-journal`);
   }
   const rootParents = [...new Set([...directories, ...files].map((entry) => path.dirname(entry)))];
-  const homeRegex = regexQuote(homeDirectory);
+  // Seatbelt regexes do not implement counted repetitions such as {8}.
+  const credentialNonce = '[a-f0-9]'.repeat(8);
+  const globalConfigNonce = '[a-f0-9]'.repeat(12);
   const patterns = [
-    `^${homeRegex}/[.]codex/[a-z_]+_[0-9]+[.]sqlite(-wal|-shm|-journal)?$`,
-    `^${homeRegex}/[.]claude[.]json([.].*)?$`,
-    `^${homeRegex}/[.]cloudcli/claude-shell-theme-[a-z-]+[.]json([.][0-9]+[.]tmp)?$`,
+    `^${regexQuote(codexHome)}/[a-z_]+_[0-9]+[.]sqlite(-wal|-shm|-journal)?$`,
+    `^${regexQuote(globalClaudeConfig)}([.][^/]*)?$`,
+    `^${regexQuote(legacyClaudeConfig)}[.]tmp[.][0-9]+[.]${globalConfigNonce}$`,
+    // The installed SDK uses eight hex digits for credential/owner atomic
+    // writes, and pid plus twelve hex digits for global config atomic writes.
+    ...[claudeCredentials, refreshOwner].map((entry) => `^${regexQuote(entry)}[.]tmp[.]${credentialNonce}$`),
+    `^${regexQuote(claudeBackups)}/[.](claude|config)[.]json[.](backup|corrupted)[.][0-9]+$`,
+    `^${regexQuote(homeDirectory)}/[.]cloudcli/claude-shell-theme-[a-z-]+[.]json([.][0-9]+[.]tmp)?$`,
   ];
   return { directories, files, rootParents, patterns };
 }
