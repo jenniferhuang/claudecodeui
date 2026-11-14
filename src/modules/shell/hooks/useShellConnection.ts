@@ -3,7 +3,7 @@ import type { MutableRefObject } from 'react';
 import type { FitAddon } from '@xterm/addon-fit';
 import type { Terminal } from '@xterm/xterm';
 
-import type { Project, ProjectSession } from '@/shared/types';
+import type { Project, ProjectSession, ShellConnectOptions, ShellDisconnectOptions } from '@/shared/types';
 import { TERMINAL_INIT_DELAY_MS } from '@/shared/constants';
 import { getShellWebSocketUrl, parseShellMessage, sendSocketMessage } from '@/modules/shell/utils/socket';
 import { readSelectedProvider } from '@/shared/selectedProvider';
@@ -35,10 +35,11 @@ type UseShellConnectionResult = {
   isConnecting: boolean;
   claudeLaunchColorScheme: 'light' | 'dark' | null;
   closeSocket: () => void;
-  connectToShell: (options?: { forceRestart?: boolean }) => void;
-  disconnectFromShell: (options?: { suppressAutoConnect?: boolean }) => void;
+  connectToShell: (options?: ShellConnectOptions) => void;
+  disconnectFromShell: (options?: ShellDisconnectOptions) => void;
 };
 
+/** Used by the Shell runtime to attach terminals without implicitly starting competing Codex writers. */
 export function useShellConnection({
   wsRef,
   terminalRef,
@@ -100,6 +101,18 @@ export function useShellConnection({
         return;
       }
 
+      if (message.type === 'session_unavailable' || message.type === 'session_exited') {
+        // An unavailable/finished Codex terminal needs an explicit Connect.
+        // Keep exit output visible, and prevent an automatic cold-start loop.
+        suppressAutoConnectRef.current = true;
+        closeSocket();
+        setIsConnected(false);
+        setIsConnecting(false);
+        setClaudeLaunchColorScheme(null);
+        connectingRef.current = false;
+        return;
+      }
+
       if (message.type === 'output') {
         const output = typeof message.data === 'string' ? message.data : '';
         handleProcessCompletion(output);
@@ -109,15 +122,26 @@ export function useShellConnection({
       }
 
       if (message.type === 'error') {
-        // The server sends this instead of spawning a PTY, then keeps the
-        // socket open — so without writing it out the terminal just stays
-        // blank forever under a green "connected" dot. Deliberately not
-        // closing the socket: `onclose` clears the screen and would erase
-        // the very message being surfaced here.
+        // Error frames need visible output. Keep ordinary terminal/observer
+        // errors connected; only the explicit initialization rejections below
+        // retire a socket without clearing the explanation.
         const detail = typeof message.message === 'string' && message.message
           ? message.message
           : 'Shell error';
         terminalRef.current?.write(`\r\n\x1b[31m${detail}\x1b[0m\r\n`);
+        const code = 'code' in message ? message.code : undefined;
+        if (code === 'CHAT_SESSION_ACTIVE' || code === 'SHELL_SESSION_ACTIVE') {
+          // These errors reject initialization before any PTY is attached.
+          // Retire only this socket, keep its explanation, and allow Connect
+          // to retry explicitly once the competing session has finished.
+          suppressAutoConnectRef.current = true;
+          closeSocket();
+          setIsConnected(false);
+          setIsConnecting(false);
+          setClaudeLaunchColorScheme(null);
+          connectingRef.current = false;
+          forceRestartOnInitRef.current = false;
+        }
         return;
       }
 
@@ -126,11 +150,11 @@ export function useShellConnection({
         setClaudeLaunchColorScheme(colorScheme === 'light' || colorScheme === 'dark' ? colorScheme : null);
       }
     },
-    [handleProcessCompletion, onOutputRef, terminalRef],
+    [closeSocket, handleProcessCompletion, onOutputRef, terminalRef],
   );
 
   const connectWebSocket = useCallback(
-    (isConnectionLocked = false) => {
+    (isConnectionLocked = false, automatic = false) => {
       if ((connectingRef.current && !isConnectionLocked) || isConnecting || isConnected) {
         return;
       }
@@ -149,11 +173,13 @@ export function useShellConnection({
         wsRef.current = socket;
 
         socket.onopen = () => {
+          if (wsRef.current !== socket) return;
           setIsConnected(true);
           setIsConnecting(false);
           connectingRef.current = false;
 
           window.setTimeout(() => {
+            if (wsRef.current !== socket || socket.readyState !== WebSocket.OPEN) return;
             const currentTerminal = terminalRef.current;
             const currentFitAddon = fitAddonRef.current;
             const currentProject = selectedProjectRef.current;
@@ -176,6 +202,8 @@ export function useShellConnection({
               initialCommand: initialCommandRef.current,
               isPlainShell: isPlainShellRef.current,
               forceRestart,
+              attachOnly: automatic && !isPlainShellRef.current &&
+                (selectedSessionRef.current?.__provider || readSelectedProvider()) === 'codex',
               // Launch-time flag: bypass mode can only join the CLI's
               // shift+tab cycle when claude starts with it.
               bypassPermissions: bypassPermissionsRef.current,
@@ -186,11 +214,14 @@ export function useShellConnection({
         };
 
         socket.onmessage = (event) => {
+          if (wsRef.current !== socket) return;
           const rawPayload = typeof event.data === 'string' ? event.data : String(event.data ?? '');
           handleSocketMessage(rawPayload);
         };
 
         socket.onclose = () => {
+          if (wsRef.current !== socket) return;
+          wsRef.current = null;
           setIsConnected(false);
           setIsConnecting(false);
           setClaudeLaunchColorScheme(null);
@@ -199,6 +230,7 @@ export function useShellConnection({
         };
 
         socket.onerror = () => {
+          if (wsRef.current !== socket) return;
           setIsConnected(false);
           setIsConnecting(false);
           connectingRef.current = false;
@@ -227,7 +259,7 @@ export function useShellConnection({
     ],
   );
 
-  const connectToShell = useCallback((options?: { forceRestart?: boolean }) => {
+  const connectToShell = useCallback((options?: ShellConnectOptions) => {
     if (!isInitialized || isConnected || isConnecting || connectingRef.current) {
       return;
     }
@@ -239,11 +271,12 @@ export function useShellConnection({
     connectWebSocket(true);
   }, [connectWebSocket, isConnected, isConnecting, isInitialized]);
 
-  const disconnectFromShell = useCallback((options?: { suppressAutoConnect?: boolean }) => {
+  const disconnectFromShell = useCallback((options?: ShellDisconnectOptions) => {
     if (options?.suppressAutoConnect) {
       suppressAutoConnectRef.current = true;
     }
 
+    if (options?.terminate) sendSocketMessage(wsRef.current, { type: 'terminate' });
     closeSocket();
     clearTerminalScreen();
     setIsConnected(false);
@@ -251,7 +284,7 @@ export function useShellConnection({
     setClaudeLaunchColorScheme(null);
     connectingRef.current = false;
     forceRestartOnInitRef.current = false;
-  }, [clearTerminalScreen, closeSocket]);
+  }, [clearTerminalScreen, closeSocket, wsRef]);
 
   useEffect(() => {
     if (
@@ -264,8 +297,10 @@ export function useShellConnection({
       return;
     }
 
-    connectToShell();
-  }, [autoConnect, connectToShell, isConnected, isConnecting, isInitialized]);
+    connectingRef.current = true;
+    setIsConnecting(true);
+    connectWebSocket(true, true);
+  }, [autoConnect, connectWebSocket, isConnected, isConnecting, isInitialized]);
 
   return {
     isConnected,

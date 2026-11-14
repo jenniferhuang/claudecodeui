@@ -305,6 +305,8 @@
     },
     "actions": {
       "disconnect": "Disconnect",
+      "endCodex": "End Codex Shell",
+      "endCodexTitle": "Stop this Codex terminal and release its session for Chat. Any running task in this terminal will stop.",
       "disconnectTitle": "Disconnect from shell",
       "restart": "Restart",
       "restartTitle": "Restart Shell",

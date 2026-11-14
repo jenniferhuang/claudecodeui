@@ -127,6 +127,15 @@ export const scheduledMessagesDb = {
     })();
   },
 
+  /** Restores only an unstarted claimed send; a cancellation must never be resurrected. */
+  restorePending(id: string): void {
+    getConnection().prepare(
+      `UPDATE scheduled_messages
+       SET status = 'pending', failure_reason = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND status = 'sent'`
+    ).run(id);
+  },
+
   markFailed(id: string, reason: string): void {
     getConnection()
       .prepare(

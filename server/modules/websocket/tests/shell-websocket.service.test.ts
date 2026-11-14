@@ -50,6 +50,99 @@ function createFakePty() {
   };
 }
 
+test('an automatic Codex attachment never starts a new writer', () => {
+  const socket = createFakeSocket();
+  const terminal = createFakePty();
+  let launches = 0;
+  handleShellConnection(socket as never, {
+    resolveProviderSessionId: () => 'native-codex-thread',
+    spawnPty: () => { launches += 1; return terminal as never; },
+  });
+  try {
+    socket.emit('message', JSON.stringify({
+      type: 'init', projectPath: process.cwd(), sessionId: 'codex-attach-only',
+      hasSession: true, provider: 'codex', attachOnly: true,
+    }));
+    assert.equal(launches, 0);
+    assert.ok(socket.frames.some((frame) => JSON.parse(frame).type === 'session_unavailable'));
+  } finally {
+    terminal.emitExit();
+  }
+});
+
+test('a Codex Shell owns its runtime and never silently falls back to a new thread', () => {
+  const socket = createFakeSocket();
+  const terminal = createFakePty();
+  let command = '';
+  handleShellConnection(socket as never, {
+    resolveProviderSessionId: () => 'native-codex-thread',
+    spawnPty: (_shell, args) => { command = String(args.at(-1)); return terminal as never; },
+  });
+  try {
+    socket.emit('message', JSON.stringify({
+      type: 'init', projectPath: process.cwd(), sessionId: 'codex-runtime-owner',
+      hasSession: true, provider: 'codex', attachOnly: false,
+    }));
+    assert.equal(command, os.platform() === 'win32'
+      ? 'codex --no-daemon resume "native-codex-thread"'
+      : 'exec codex --no-daemon resume "native-codex-thread"');
+  } finally {
+    terminal.emitExit();
+  }
+});
+
+test('ending a Codex Shell affects only that terminal', () => {
+  const terminals = [createFakePty(), createFakePty()];
+  const sockets = [createFakeSocket(), createFakeSocket()];
+  try {
+    sockets.forEach((socket, index) => {
+      handleShellConnection(socket as never, {
+        resolveProviderSessionId: (id) => id,
+        spawnPty: () => terminals[index] as never,
+      });
+      socket.emit('message', JSON.stringify({
+        type: 'init', projectPath: process.cwd(), sessionId: `codex-end-${index}`,
+        hasSession: true, provider: 'codex', attachOnly: false,
+      }));
+    });
+    sockets[0].emit('message', JSON.stringify({ type: 'terminate' }));
+    assert.equal(terminals[0].killed, true);
+    assert.equal(terminals[1].killed, false);
+  } finally {
+    terminals.forEach((terminal) => terminal.emitExit());
+  }
+});
+
+test('a replaced socket cannot type, resize or terminate the current terminal', () => {
+  const terminal = createFakePty();
+  let writes = 0;
+  let resizes = 0;
+  terminal.write = () => { writes += 1; };
+  terminal.resize = () => { resizes += 1; };
+  const dependencies = { resolveProviderSessionId: () => null, spawnPty: () => terminal as never };
+  const oldSocket = createFakeSocket();
+  const currentSocket = createFakeSocket();
+  const init = JSON.stringify({
+    type: 'init', projectPath: process.cwd(), sessionId: 'codex-stale-controller', provider: 'codex', attachOnly: false,
+  });
+  handleShellConnection(oldSocket as never, dependencies);
+  handleShellConnection(currentSocket as never, dependencies);
+  try {
+    oldSocket.emit('message', init);
+    currentSocket.emit('message', init);
+    oldSocket.emit('message', JSON.stringify({ type: 'input', data: 'unexpected command' }));
+    oldSocket.emit('message', JSON.stringify({ type: 'resize', cols: 20, rows: 10 }));
+    oldSocket.emit('message', JSON.stringify({ type: 'terminate' }));
+    assert.equal(writes, 0);
+    assert.equal(resizes, 0);
+    assert.equal(terminal.killed, false);
+    currentSocket.emit('message', JSON.stringify({ type: 'input', data: 'current command' }));
+    assert.equal(writes, 1);
+  } finally {
+    terminal.emitExit();
+  }
+});
+
 test('a stale socket close cannot detach the socket that replaced it', () => {
   const pty = createFakePty();
   const dependencies = {
@@ -686,7 +779,7 @@ test('claude launches report the app theme they started in, also on reattach', (
     const silentLaunches = [
       launch(dependencies, { provider: 'claude' }, projectPath),
       launch(dependencies, { provider: 'claude', initialCommand: 'claude /login', colorScheme: 'light' }, projectPath),
-      launch(dependencies, { provider: 'codex', colorScheme: 'light' }, projectPath),
+      launch(dependencies, { provider: 'codex', colorScheme: 'light', attachOnly: false }, projectPath),
       launch(dependencies, { provider: 'plain-shell', isPlainShell: true, colorScheme: 'light' }, projectPath),
     ];
     assert.deepEqual(silentLaunches.map(themeFrames), [[], [], [], []]);
@@ -733,12 +826,12 @@ test('other shells and initial commands only get the COLORFGBG hint', () => {
       projectPath
     );
     launch(dependencies, { provider: 'claude', initialCommand: loginCommand, colorScheme: 'light' }, projectPath);
-    launch(dependencies, { provider: 'codex', colorScheme: 'light' }, projectPath);
-    launch(dependencies, { provider: 'codex', colorScheme: 'dark' }, projectPath);
+    launch(dependencies, { provider: 'codex', colorScheme: 'light', attachOnly: false }, projectPath);
+    launch(dependencies, { provider: 'codex', colorScheme: 'dark', attachOnly: false }, projectPath);
 
     assert.deepEqual(
       calls.map((call) => call.command),
-      ['npx task-master init', loginCommand, 'codex', 'codex']
+      ['npx task-master init', loginCommand, ...Array(2).fill(os.platform() === 'win32' ? 'codex --no-daemon' : 'exec codex --no-daemon')]
     );
     assert.deepEqual(
       calls.map((call) => call.env.COLORFGBG),
