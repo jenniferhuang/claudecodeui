@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef } from 'react';
-import { Check, ChevronDown, ChevronRight, Edit3, Star, Trash2, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Edit3, Folder, FolderOpen, Star, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { Button } from '@/shared/ui';
@@ -141,6 +141,8 @@ function SidebarProjectItem({
 
   const isCompact = useCompactSidebar();
 
+  const ProjectFolderIcon = isExpanded ? FolderOpen : Folder;
+
   const toggleProject = () => onToggleProject(project.projectId);
   const toggleStarProject = () => onToggleStarProject(project.projectId);
 
@@ -157,8 +159,8 @@ function SidebarProjectItem({
   };
 
   return (
-    <div className={cn('md:space-y-1', isDeleting && 'opacity-50 pointer-events-none')}>
-      <div className="sticky top-0 z-10 md:group group">
+    <div className={cn('space-y-2', isDeleting && 'opacity-50 pointer-events-none')}>
+      <div className="group sticky top-0 z-10 bg-background">
         {isCompact && (
         <div className="bg-background">
           <div
@@ -227,8 +229,9 @@ function SidebarProjectItem({
                     />
                   ) : (
                     <>
-                      <div className="flex min-w-0 flex-1 items-center justify-between">
-                        <h3 className="truncate text-sm font-normal text-foreground">{project.displayName}</h3>
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <ProjectFolderIcon className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                        <h3 className="min-w-0 truncate text-sm font-medium text-foreground">{project.displayName}</h3>
                         {tasksEnabled && (
                           <TaskIndicator
                             status={taskStatus}
@@ -306,12 +309,12 @@ function SidebarProjectItem({
         <Button
           variant="ghost"
           className={cn(
-            'sticky top-0 z-10 flex w-full justify-between p-2 h-auto font-normal hover:bg-accent/50',
+            'sticky top-0 z-10 flex h-auto w-full justify-between rounded-lg border border-border/60 p-2 font-normal hover:bg-accent/50',
             isSelected
               ? 'bg-accent text-accent-foreground'
               : isStarred
                 ? 'bg-background hover:bg-accent/50'
-                : 'bg-background',
+                : 'bg-muted/30',
             isStarred &&
               !isSelected &&
               'bg-yellow-50/50 dark:bg-yellow-900/10 hover:bg-yellow-100/50 dark:hover:bg-yellow-900/20',
@@ -368,8 +371,9 @@ function SidebarProjectItem({
                 </div>
               ) : (
                 <div>
-                  <div className="truncate text-sm font-normal text-foreground" title={project.displayName}>
-                    {project.displayName}
+                  <div className="flex min-w-0 items-center gap-2 text-sm font-medium text-foreground" title={project.displayName}>
+                    <ProjectFolderIcon className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+                    <span className="truncate">{project.displayName}</span>
                   </div>
                   <div className="text-xs text-muted-foreground">
                     {sessionCountDisplay}

@@ -182,7 +182,7 @@ export default function SidebarProjectSessions({
       : t('sessions.selectAll');
 
   return (
-    <div className="ml-1.5 space-y-1 border-l border-border/70 pl-1.5">
+    <div className="ml-4 space-y-1 border-l border-border/70 pl-3">
       {/* A page emptied by deleting every loaded row still has sessions behind
           it on the server, so it keeps its "Load more" instead of "No sessions". */}
       {!initialSessionsLoaded ? (
