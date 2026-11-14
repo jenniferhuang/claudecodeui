@@ -8,6 +8,7 @@ on:
 
 jobs:
   build-macos:
+    if: github.repository == 'siteboon/claudecodeui'
     name: Build macOS desktop artifact
     runs-on: macos-latest
     permissions:
