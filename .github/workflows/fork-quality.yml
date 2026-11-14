@@ -39,6 +39,9 @@ jobs:
           cache: npm
       - name: Install locked dependencies
         run: npm ci --no-audit --no-fund
+        env:
+          # ripgrep postinstall fetches public GitHub release assets.
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Test fork release safeguards
         run: node --test scripts/release/fork-release.test.mjs
       - name: Backend tests
@@ -55,6 +58,8 @@ jobs:
         run: node scripts/release/fork-release.mjs pack
       - name: Install production tarball and smoke test CLI and SDK
         run: node scripts/release/fork-release.mjs smoke
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Upload the tested Linux release assets
         if: matrix.os == 'ubuntu-22.04'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
