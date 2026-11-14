@@ -136,7 +136,8 @@ function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): Norma
 }
 
 /**
- * Fired when a run reaches its terminal `complete` and the session goes idle.
+ * Fired at UI completion and again when a Codex runtime finishes cleanup.
+ * Listeners must recheck ownership; repeated notifications are intentional.
  *
  * The queued-message dispatcher subscribes so a message the user queued during
  * a turn is sent as soon as that turn ends, instead of waiting for the next
@@ -152,7 +153,8 @@ export function onRunSettled(listener: (appSessionId: string) => void): () => vo
   };
 }
 
-function notifyRunSettled(appSessionId: string): void {
+/** Used by the Chat gateway to wake queued turns after the Codex runtime reservation is released. */
+export function notifyRunSettled(appSessionId: string): void {
   for (const listener of settledListeners) {
     queueMicrotask(() => {
       // Unsubscribed between the settle and this microtask: stay quiet.

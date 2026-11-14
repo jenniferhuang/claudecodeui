@@ -18,6 +18,7 @@ type ShellHeaderProps = {
   restartLabel: string;
   restartTitle: string;
   disableRestart: boolean;
+  showRestart?: boolean;
   showBypassToggle: boolean;
   bypassEnabled: boolean;
   onToggleBypass: () => void;
@@ -44,6 +45,7 @@ export default function ShellHeader({
   restartLabel,
   restartTitle,
   disableRestart,
+  showRestart = true,
   showBypassToggle,
   bypassEnabled,
   onToggleBypass,
@@ -101,16 +103,18 @@ export default function ShellHeader({
             </button>
           )}
 
-          <button
-            type="button"
-            onClick={onRestart}
-            disabled={disableRestart}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium text-foreground shadow-sm transition-colors hover:border-blue-400/70 hover:bg-blue-600 hover:text-white focus:outline-none focus:ring-2 focus:ring-blue-400/70 focus:ring-offset-2 focus:ring-offset-card disabled:cursor-not-allowed disabled:border-transparent disabled:bg-transparent disabled:text-muted-foreground disabled:opacity-60 disabled:shadow-none"
-            title={restartTitle}
-          >
-            <RotateCcw className={`h-3.5 w-3.5 ${isRestarting ? 'animate-spin' : ''}`} aria-hidden="true" />
-            <span>{restartLabel}</span>
-          </button>
+          {showRestart && (
+            <button
+              type="button"
+              onClick={onRestart}
+              disabled={disableRestart}
+              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium text-foreground shadow-sm transition-colors hover:border-blue-400/70 hover:bg-blue-600 hover:text-white focus:outline-none focus:ring-2 focus:ring-blue-400/70 focus:ring-offset-2 focus:ring-offset-card disabled:cursor-not-allowed disabled:border-transparent disabled:bg-transparent disabled:text-muted-foreground disabled:opacity-60 disabled:shadow-none"
+              title={restartTitle}
+            >
+              <RotateCcw className={`h-3.5 w-3.5 ${isRestarting ? 'animate-spin' : ''}`} aria-hidden="true" />
+              <span>{restartLabel}</span>
+            </button>
+          )}
         </div>
       </div>
 

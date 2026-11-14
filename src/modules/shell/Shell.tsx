@@ -235,8 +235,8 @@ export default function Shell({
       restartTimerRef.current = null;
     }
     setIsRestarting(false);
-    disconnectFromShell({ suppressAutoConnect: true });
-  }, [disconnectFromShell]);
+    disconnectFromShell({ suppressAutoConnect: true, terminate: shellProvider === 'codex' });
+  }, [disconnectFromShell, shellProvider]);
 
   useEffect(() => {
     if (
@@ -310,8 +310,9 @@ export default function Shell({
         statusRestartingText={t('shell.status.restarting')}
         showThemeRestartHint={isClaudeThemeOutdated}
         themeRestartHintText={t('shell.status.themeRestartHint')}
-        disconnectLabel={t('shell.actions.disconnect')}
-        disconnectTitle={t('shell.actions.disconnectTitle')}
+        disconnectLabel={t(shellProvider === 'codex' ? 'shell.actions.endCodex' : 'shell.actions.disconnect')}
+        disconnectTitle={t(shellProvider === 'codex' ? 'shell.actions.endCodexTitle' : 'shell.actions.disconnectTitle')}
+        showRestart={shellProvider !== 'codex'}
         restartLabel={t('shell.actions.restart')}
         restartTitle={t('shell.actions.restartTitle')}
         disableRestart={isRestarting || !isInitialized}
@@ -339,7 +340,7 @@ export default function Shell({
             connectLabel={t('shell.actions.connect')}
             connectTitle={t('shell.actions.connectTitle')}
             connectingLabel={t('shell.connecting')}
-            onConnect={handleRestartShell}
+            onConnect={() => connectToShell()}
           />
         )}
 

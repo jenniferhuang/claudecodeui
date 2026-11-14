@@ -12,6 +12,8 @@ type ShellInitMessage = {
   initialCommand: string | null | undefined;
   isPlainShell: boolean;
   forceRestart?: boolean;
+  // Automatic connections may reattach a Codex PTY but cannot create a writer.
+  attachOnly?: boolean;
   bypassPermissions?: boolean;
   // The app theme at launch, so the server can start a CLI in the colour scheme
   // the terminal is painted in.
@@ -29,10 +31,11 @@ type ShellInputMessage = {
   data: string;
 };
 
-type ShellOutgoingMessage = ShellInitMessage | ShellResizeMessage | ShellInputMessage;
+type ShellOutgoingMessage = ShellInitMessage | ShellResizeMessage | ShellInputMessage | { type: 'terminate' };
 
 type ShellIncomingMessage =
   | { type: 'output'; data: string }
+  | { type: 'session_unavailable' | 'session_exited' }
   // Sent instead of starting a PTY when the project path or session id is
   // rejected, so this is the only signal that the terminal will never start.
   | { type: 'error'; message?: string }

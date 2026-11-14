@@ -1,7 +1,7 @@
-import { scheduledMessagesDb, sessionDraftsDb } from '@/modules/database/index.js';
+import { scheduledMessagesDb, sessionDraftsDb, sessionsDb } from '@/modules/database/index.js';
 import type { QueuedSessionMessageRecord, ScheduledMessageRow } from '@/modules/database/index.js';
 import { announceScheduledMessagesChanged } from '@/modules/scheduled-messages/services/scheduled-messages.service.js';
-import { chatRunRegistry, onRunSettled, runDetachedChatTurn } from '@/modules/websocket/index.js';
+import { chatRunRegistry, hasActiveCodexShellSession, isCodexChatSessionActive, onRunSettled, refreshCodexShellSessionOwnership, runDetachedChatTurn } from '@/modules/websocket/index.js';
 import type { ProviderRuntimeGateway } from '@/modules/websocket/index.js';
 import { readQueuedChatMessage } from '@/shared/utils.js';
 
@@ -28,6 +28,8 @@ let unsubscribeRunSettled: (() => void) | null = null;
  * those sends finish, so they neither overtake nor interrupt them.
  */
 const sessionsSending = new Set<string>();
+/** Deduplicates a scoped wake that arrives before this session's dispatch releases. */
+const sessionsSettledDuringSend = new Set<string>();
 
 function readOptions(raw: string): Record<string, unknown> {
   try {
@@ -62,7 +64,7 @@ async function sendClaimedQueuedMessage(
 
   // The registry check and run reservation are separate operations. If a run
   // wins that tiny race, put the turn back so the next poll tries again.
-  if (!result.started && result.error === 'A run was already in progress for this session.') {
+  if (!result.started && (result.retryable || result.error === 'A run was already in progress for this session.')) {
     sessionDraftsDb.restoreQueuedMessage(candidate);
     return;
   }
@@ -78,10 +80,19 @@ async function sendClaimedQueuedMessage(
  * work, which is why the composer asks before an interactive send. A queued
  * turn was promised to go "when this finishes", so it waits for that work too.
  */
-function isSessionBusy(sessionId: string, runtime: ProviderRuntimeGateway): boolean {
+async function isSessionBusy(sessionId: string, runtime: ProviderRuntimeGateway): Promise<boolean> {
   // sessionsSending too: a scheduled turn can complete before its send settles,
   // and the session's next due row would then interrupt this queued turn.
-  return chatRunRegistry.isProcessing(sessionId) || runtime.hasBackgroundWork(sessionId) || sessionsSending.has(sessionId);
+  if (chatRunRegistry.isProcessing(sessionId) || runtime.hasBackgroundWork(sessionId) || sessionsSending.has(sessionId)) return true;
+  const session = sessionsDb.getSessionById(sessionId);
+  if (session?.provider !== 'codex') return false;
+  const ownership = await refreshCodexShellSessionOwnership(sessionId, session.provider_session_id);
+  // Discovery can yield; recheck admission immediately before the claim.
+  return ownership === 'writer-held' ||
+    chatRunRegistry.isProcessing(sessionId) || runtime.hasBackgroundWork(sessionId) || sessionsSending.has(sessionId) ||
+    isCodexChatSessionActive(sessionId) ||
+    (session.provider_session_id !== null && isCodexChatSessionActive(session.provider_session_id)) ||
+    hasActiveCodexShellSession(sessionId, session.provider_session_id);
 }
 
 /**
@@ -98,7 +109,7 @@ export async function dispatchQueuedMessages(
   let claimed = 0;
 
   await Promise.all(candidates.map(async (candidate) => {
-    if (isSessionBusy(candidate.sessionId, runtime)) {
+    if (await isSessionBusy(candidate.sessionId, runtime)) {
       return;
     }
     if (!sessionDraftsDb.claimQueuedMessage(candidate)) {
@@ -120,7 +131,7 @@ function recordFailure(row: ScheduledMessageRow, reason: string): void {
 async function sendClaimedMessage(
   row: ScheduledMessageRow,
   runtime: ProviderRuntimeGateway,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const result = await runDetachedChatTurn(
       {
@@ -136,6 +147,12 @@ async function sendClaimedMessage(
       { runtime },
     );
 
+    if (!result.started && result.retryable) {
+      scheduledMessagesDb.restorePending(row.id);
+      announceScheduledMessagesChanged(row.session_id);
+      return false;
+    }
+
     // Recorded rather than retried, and recorded whether the run never started
     // (deleted session, unavailable provider) or started and then failed.
     // Silently dropping a message the user scheduled is worse than telling
@@ -147,6 +164,7 @@ async function sendClaimedMessage(
     const message = error instanceof Error ? error.message : String(error);
     recordFailure(row, message);
   }
+  return true;
 }
 
 /**
@@ -157,10 +175,16 @@ async function sendClaimedMessage(
 export async function dispatchDueScheduledMessages(
   runtime: ProviderRuntimeGateway,
   now: Date = new Date(),
+  sessionId?: string,
 ): Promise<number> {
   // Claimed before any of them runs, so a long turn cannot let the next poll
   // pick the same message up again.
-  const due = scheduledMessagesDb.claimDue(now, sessionsSending);
+  const scopedRow = sessionId && !sessionsSending.has(sessionId)
+    ? scheduledMessagesDb.claimNextDue(sessionId, now)
+    : null;
+  const due = sessionId
+    ? (scopedRow ? [scopedRow] : [])
+    : scheduledMessagesDb.claimDue(now, sessionsSending);
   if (due.length === 0) {
     return 0;
   }
@@ -185,7 +209,7 @@ export async function dispatchDueScheduledMessages(
     try {
       let row: ScheduledMessageRow | null = first;
       while (row) {
-        await sendClaimedMessage(row, runtime);
+        if (!await sendClaimedMessage(row, runtime)) break;
         sent += 1;
         row = scheduledMessagesDb.claimNextDue(sessionId, now);
         if (row) announceScheduledMessagesChanged(sessionId);
@@ -194,6 +218,9 @@ export async function dispatchDueScheduledMessages(
       logPassFailure(error);
     } finally {
       sessionsSending.delete(sessionId);
+      if (sessionsSettledDuringSend.delete(sessionId) && unsubscribeRunSettled) {
+        void dispatchDueScheduledMessages(runtime, new Date(), sessionId).catch(logPassFailure);
+      }
       // A run that settled while this session's sends were going was skipped
       // by the run-settled listener (isSessionBusy), so the queued turn it
       // unblocked goes now instead of waiting for the next poll.
@@ -258,6 +285,8 @@ export function initializeScheduledMessageDispatcher(runtime: ProviderRuntimeGat
   // the settled session, so several runs ending together do not each rescan
   // every queued turn.
   unsubscribeRunSettled = onRunSettled((appSessionId) => {
+    if (sessionsSending.has(appSessionId)) sessionsSettledDuringSend.add(appSessionId);
+    else void dispatchDueScheduledMessages(runtime, new Date(), appSessionId).catch(logPassFailure);
     void dispatchQueuedMessages(runtime, appSessionId).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       console.error('[ScheduledMessages] Run-settled dispatch failed', { error: message });
@@ -269,6 +298,7 @@ export function initializeScheduledMessageDispatcher(runtime: ProviderRuntimeGat
 }
 
 export function closeScheduledMessageDispatcher(): void {
+  sessionsSettledDuringSend.clear();
   if (unsubscribeRunSettled) {
     unsubscribeRunSettled();
     unsubscribeRunSettled = null;

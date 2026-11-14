@@ -4,7 +4,7 @@ import type { FitAddon } from '@xterm/addon-fit';
 import type { Terminal } from '@xterm/xterm';
 
 import { useTheme } from '@/shared/context/ThemeContext';
-import type { Project, ProjectSession } from '@/shared/types';
+import type { Project, ProjectSession, ShellConnectOptions, ShellDisconnectOptions } from '@/shared/types';
 import { useShellConnection } from '@/modules/shell/hooks/useShellConnection';
 import { useShellTerminal } from '@/modules/shell/hooks/useShellTerminal';
 
@@ -31,8 +31,8 @@ type UseShellRuntimeResult = {
   // A live Claude CLI was launched in the other theme and keeps those colours
   // until it is restarted.
   isClaudeThemeOutdated: boolean;
-  connectToShell: (options?: { forceRestart?: boolean }) => void;
-  disconnectFromShell: (options?: { suppressAutoConnect?: boolean }) => void;
+  connectToShell: (options?: ShellConnectOptions) => void;
+  disconnectFromShell: (options?: ShellDisconnectOptions) => void;
 };
 
 export function useShellRuntime({
@@ -79,14 +79,13 @@ export function useShellRuntime({
       return;
     }
 
+    wsRef.current = null;
     if (
       activeSocket.readyState === WebSocket.OPEN ||
       activeSocket.readyState === WebSocket.CONNECTING
     ) {
       activeSocket.close();
     }
-
-    wsRef.current = null;
   }, []);
 
   const { isInitialized, clearTerminalScreen, disposeTerminal } = useShellTerminal({
