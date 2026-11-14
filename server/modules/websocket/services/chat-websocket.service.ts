@@ -11,8 +11,8 @@ import {
   sessionsService,
   sideQuestionsService,
 } from '@/modules/providers/index.js';
-import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
-import { hasActiveCodexShellSession } from '@/modules/websocket/services/shell-websocket.service.js';
+import { chatRunRegistry, notifyRunSettled } from '@/modules/websocket/services/chat-run-registry.service.js';
+import { hasActiveCodexShellSession, refreshCodexShellSessionOwnership } from '@/modules/websocket/services/shell-websocket.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import {
   getGlobalImageAssetsDir,
@@ -104,9 +104,23 @@ const activeCodexChatSessions = new Set<string>();
 
 /** Used by the websocket gateway to defer Shell launches until the Codex Chat runtime has released its writer. */
 export function isCodexChatSessionActive(sessionId: string): boolean {
-  return activeCodexChatSessions.has(sessionId) || (
-    chatRunRegistry.getRun(sessionId)?.provider === 'codex' && chatRunRegistry.isProcessing(sessionId)
-  );
+  if (activeCodexChatSessions.has(sessionId)) return true;
+  if (activeCodexChatSessions.size > 0) {
+    const requestedSession = sessionsDb.getSessionById(sessionId);
+    const identities = new Set([sessionId]);
+    if (requestedSession?.provider === 'codex' && requestedSession.provider_session_id) {
+      identities.add(requestedSession.provider_session_id);
+    }
+    // A fresh run learns its native identity after admission. Resolve the
+    // current row so its later native alias shares the original reservation.
+    for (const activeId of activeCodexChatSessions) {
+      if (identities.has(activeId)) return true;
+      const activeSession = sessionsDb.getSessionById(activeId);
+      if (activeSession?.provider === 'codex' && activeSession.provider_session_id &&
+          identities.has(activeSession.provider_session_id)) return true;
+    }
+  }
+  return chatRunRegistry.getRun(sessionId)?.provider === 'codex' && chatRunRegistry.isProcessing(sessionId);
 }
 
 /**
@@ -244,12 +258,10 @@ function readVerifiedAttachments(clientOptions: AnyRecord): ChatAttachmentDescri
   );
 }
 
-/**
- * Registers the run and hands the turn to the provider runtime.
- *
- * `extraRuntimeOptions` is how an edited message asks the provider to resume
- * partway instead of continuing from the tip; a normal send passes nothing.
- */
+/** One admission result; temporary writer ownership must never consume a queued turn. */
+type ChatDispatchResult = { started: boolean; error: string | null; retryable?: boolean };
+
+/** Holds both app and native identities until Codex cleanup finishes, independently of UI completion. */
 async function dispatchRun(
   ws: WebSocket | null,
   userId: string | number | null,
@@ -259,22 +271,65 @@ async function dispatchRun(
   dependencies: ChatWebSocketDependencies,
   extraRuntimeOptions: AnyRecord = {},
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
-): Promise<{ started: boolean; error: string | null }> {
-  const provider = session.provider as LLMProvider;
-
-  // Check before reserving a run or rewinding history. A detached Shell still
-  // owns its runtime; only its actual process exit releases that ownership.
-  if (provider === 'codex' && hasActiveCodexShellSession(sessionId, session.provider_session_id)) {
-    const error = 'This Codex session is open in Shell. Finish its task, then use End Codex Shell (or /exit) before continuing in Chat.';
-    if (ws) sendProtocolError(ws, 'SHELL_SESSION_ACTIVE', error, sessionId);
-    return { started: false, error };
+): Promise<ChatDispatchResult> {
+  if (session.provider !== 'codex') {
+    return dispatchReservedRun(ws, userId, sessionId, session, data, dependencies, extraRuntimeOptions, beforeRun);
   }
-
-  if (provider === 'codex' && activeCodexChatSessions.has(sessionId)) {
+  const identities = new Set([sessionId, session.provider_session_id].filter((id): id is string => Boolean(id)));
+  if (Array.from(identities).some((id) => isCodexChatSessionActive(id))) {
     const error = 'The previous Codex run is still releasing this session. Please retry when it has finished.';
     if (ws) sendProtocolError(ws, 'RUN_IN_PROGRESS', error, sessionId);
-    return { started: false, error };
+    return { started: false, error, retryable: true };
   }
+  // Reserve synchronously before any ownership discovery can yield. Shell must
+  // recheck these identities immediately before it starts its own runtime.
+  for (const id of identities) activeCodexChatSessions.add(id);
+  let runtimeStarted = false;
+  try {
+    // Fresh Shells learn their native id after startup. Only positively
+    // associated identities block this thread; an unknown owner is not a
+    // global Codex lock. Recheck synchronously after the discovery await.
+    const ownership = await refreshCodexShellSessionOwnership(sessionId, session.provider_session_id);
+    if (ownership === 'writer-held') {
+      const error = 'Codex is still releasing this thread. Retry after its writer exits.';
+      if (ws) sendProtocolError(ws, 'RUN_IN_PROGRESS', error, sessionId);
+      return { started: false, error, retryable: true };
+    }
+    // Check before reserving a run or rewinding history. A detached Shell still
+    // owns its runtime; only its actual process exit releases that ownership.
+    if (hasActiveCodexShellSession(sessionId, session.provider_session_id)) {
+      const error = 'This Codex session is open in Shell. Finish its task, then use End Codex Shell (or /exit) before continuing in Chat.';
+      if (ws) sendProtocolError(ws, 'SHELL_SESSION_ACTIVE', error, sessionId);
+      return { started: false, error, retryable: true };
+    }
+    const result = await dispatchReservedRun(ws, userId, sessionId, session, data, dependencies, extraRuntimeOptions, beforeRun);
+    runtimeStarted = result.started;
+    return result;
+  } finally {
+    for (const id of identities) activeCodexChatSessions.delete(id);
+    // `complete` can precede process cleanup. Its first notification leaves
+    // queued messages untouched; this one makes them eligible after release.
+    if (runtimeStarted) notifyRunSettled(sessionId);
+  }
+}
+
+/**
+ * Registers the run and hands the turn to the provider runtime.
+ *
+ * `extraRuntimeOptions` is how an edited message asks the provider to resume
+ * partway instead of continuing from the tip; a normal send passes nothing.
+ */
+async function dispatchReservedRun(
+  ws: WebSocket | null,
+  userId: string | number | null,
+  sessionId: string,
+  session: NonNullable<ReturnType<typeof sessionsDb.getSessionById>>,
+  data: AnyRecord,
+  dependencies: ChatWebSocketDependencies,
+  extraRuntimeOptions: AnyRecord = {},
+  beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
+): Promise<ChatDispatchResult> {
+  const provider = session.provider as LLMProvider;
 
   const run = chatRunRegistry.startRun({
     appSessionId: sessionId,
@@ -293,7 +348,7 @@ async function dispatchRun(
         sessionId
       );
     }
-    return { started: false, error: 'A run is already in progress for this session.' };
+    return { started: false, error: 'A run is already in progress for this session.', retryable: true };
   }
 
   const clientOptions = (data.options ?? {}) as AnyRecord;
@@ -331,7 +386,6 @@ async function dispatchRun(
   };
 
   let failure: string | null = null;
-  if (provider === 'codex') activeCodexChatSessions.add(sessionId);
   try {
     // Runs only now that the session is reserved, because an edit rewinds the
     // conversation here and a rewind for a run that was never admitted cannot
@@ -343,7 +397,6 @@ async function dispatchRun(
     failure = error instanceof Error ? error.message : String(error);
     console.error(`[Chat] Provider runtime "${provider}" failed`, { sessionId, error: failure });
   } finally {
-    if (provider === 'codex') activeCodexChatSessions.delete(sessionId);
     // Safety net: a runtime that crashed (or resolved) without emitting its
     // terminal `complete` would otherwise leave the session stuck in
     // "processing" forever on every connected client. Scoped to THIS run —
@@ -902,7 +955,7 @@ export async function runDetachedChatTurn(
     interruptActiveRun?: boolean;
   },
   dependencies: ChatWebSocketDependencies,
-): Promise<{ started: boolean; error: string | null }> {
+): Promise<ChatDispatchResult> {
   const session = sessionsDb.getSessionById(input.sessionId);
   if (!session) {
     return { started: false, error: 'The session no longer exists.' };
@@ -916,7 +969,7 @@ export async function runDetachedChatTurn(
   const activeRun = chatRunRegistry.getRun(input.sessionId);
   if (activeRun && activeRun.status === 'running') {
     if (!input.interruptActiveRun) {
-      return { started: false, error: 'A run was already in progress for this session.' };
+      return { started: false, error: 'A run was already in progress for this session.', retryable: true };
     }
     // Same shape as `chat.abort`: cancel the provider run and emit the
     // terminal `complete` on its behalf, so every watching client sees the

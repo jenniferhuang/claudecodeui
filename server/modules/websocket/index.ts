@@ -7,5 +7,7 @@ export { chatRunRegistry, onRunSettled } from './services/chat-run-registry.serv
 export { broadcastSessionUpserted, broadcastSessionUpsertedBatch } from './services/session-upsert-broadcast.service.js';
 // runDetachedChatTurn: used by the scheduled-messages module to run a turn
 // from a timer, with no socket to stream to or report errors on.
-export { runDetachedChatTurn } from './services/chat-websocket.service.js';
+export { runDetachedChatTurn, isCodexChatSessionActive } from './services/chat-websocket.service.js';
+// Scheduled messages preserve queued turns while the same native thread is open in Shell.
+export { hasActiveCodexShellSession, refreshCodexShellSessionOwnership } from './services/shell-websocket.service.js';
 export type { ProviderRuntimeGateway } from './services/chat-websocket.service.js';

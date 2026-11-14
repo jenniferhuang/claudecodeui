@@ -7,6 +7,8 @@ import { WebSocket, type RawData } from 'ws';
 
 import { parseIncomingJsonObject, stripAnsiSequences } from '@/shared/utils.js';
 
+import { hasOpenCodexThreadLock, inspectOwnedCodexShellThread } from './codex-shell-identity.service.js';
+
 type ShellIncomingMessage = {
   type?: string;
   data?: string;
@@ -35,6 +37,7 @@ type PtySessionEntry = {
   sessionId: string | null;
   provider: string;
   providerSessionId: string | null;
+  codexHome: string;
   // Keep ownership until onExit confirms the process has released its writer.
   terminating: boolean;
   // The app theme a Claude CLI in this pty was launched for; null for any other
@@ -55,6 +58,35 @@ export function hasActiveCodexShellSession(sessionId: string, providerSessionId?
     (entry.sessionId !== null && ids.has(entry.sessionId)) ||
     (entry.providerSessionId !== null && ids.has(entry.providerSessionId))
   ));
+}
+
+/**
+ * Used by Chat, scheduled dispatch and Shell admission before their final
+ * synchronous ownership check. Fresh Codex histories are associated only from
+ * the retained process group's unique native lock FD. Inspection failure stays
+ * unassociated so it cannot block unrelated sessions on unsupported platforms.
+ */
+export async function refreshCodexShellSessionOwnership(
+  sessionId: string,
+  providerSessionId?: string | null,
+): Promise<'ready' | 'unknown' | 'writer-held'> {
+  if (!providerSessionId || hasActiveCodexShellSession(sessionId, providerSessionId)) return 'ready';
+  const pending = [...ptySessionsMap.entries()].filter(([, entry]) => entry.provider === 'codex' && !entry.providerSessionId);
+  const results = await Promise.all(pending.map(async ([key, entry]) => {
+    const nativeId = await inspectOwnedCodexShellThread(entry.pty.pid, entry.codexHome);
+    if (ptySessionsMap.get(key) !== entry) return 'ready';
+    if (nativeId) entry.providerSessionId = nativeId;
+    return nativeId === undefined ? 'unknown' : 'ready';
+  }));
+  if (hasActiveCodexShellSession(sessionId, providerSessionId)) return 'ready';
+  const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+  if (SAFE_SESSION_ID_PATTERN.test(providerSessionId)
+    && fs.existsSync(path.join(codexHome, 'thread-writer-locks', `${providerSessionId}.lock`))) {
+    const writerOpen = await hasOpenCodexThreadLock(providerSessionId, codexHome);
+    if (writerOpen) return 'writer-held';
+    if (writerOpen === undefined) return 'unknown';
+  }
+  return results.includes('unknown') ? 'unknown' : 'ready';
 }
 
 function normalizeDetectedUrl(url: string): string | null {
@@ -225,12 +257,12 @@ type ShellLaunch = {
 function buildShellCommand(
   message: ShellIncomingMessage,
   dependencies: ShellWebSocketDependencies,
-  projectPath: string
+  projectPath: string,
+  resumeSessionId = resolveResumeSessionId(message, dependencies),
 ): ShellLaunch {
   const hasSession = readBoolean(message.hasSession);
   const initialCommand = readString(message.initialCommand);
   const provider = readString(message.provider, 'claude');
-  const resumeSessionId = resolveResumeSessionId(message, dependencies);
   const isPlainShell =
     readBoolean(message.isPlainShell) ||
     (!!initialCommand && !hasSession) ||
@@ -550,8 +582,11 @@ export function handleShellConnection(
   let ptySessionKey: string | null = null;
   let urlDetectionBuffer = '';
   const announcedAuthUrls = new Set<string>();
+  let initializationPending = false;
+  let connectionClosed = false;
 
   ws.on('message', async (rawMessage) => {
+    let initializingThisMessage = false;
     try {
       const data = parseShellMessage(rawMessage);
       if (!data?.type) {
@@ -559,10 +594,12 @@ export function handleShellConnection(
       }
 
       if (data.type === 'init') {
-        if (shellProcess) {
+        if (shellProcess || initializationPending) {
           ws.send(JSON.stringify({ type: 'error', message: 'This socket already has a terminal. Reconnect to change sessions.' }));
           return;
         }
+        initializationPending = true;
+        initializingThisMessage = true;
         const projectPath = readString(data.projectPath, process.cwd());
         const sessionId = readString(data.sessionId) || null;
         const hasSession = readBoolean(data.hasSession);
@@ -656,6 +693,23 @@ export function handleShellConnection(
 
         const resumeSessionId = resolveResumeSessionId(data, dependencies);
         if (provider === 'codex' && !isPlainShell) {
+          const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+          const needsDiscovery = resumeSessionId && !hasActiveCodexShellSession(sessionId ?? '', resumeSessionId) && (
+            [...ptySessionsMap.values()].some((entry) => entry.provider === 'codex' && !entry.providerSessionId)
+            || fs.existsSync(path.join(codexHome, 'thread-writer-locks', `${resumeSessionId}.lock`))
+          );
+          const ownership = needsDiscovery ? await refreshCodexShellSessionOwnership(sessionId ?? '', resumeSessionId) : 'ready';
+          if (connectionClosed || ws.readyState !== WebSocket.OPEN) return;
+          // Another socket can claim this destination while identity inspection awaits.
+          if (ptySessionsMap.has(ptySessionKey)) {
+            ws.send(JSON.stringify({ type: 'error', code: 'SHELL_SESSION_ACTIVE', message: 'Another connection opened this Shell. Connect again to attach to it.' }));
+            return;
+          }
+          if (ownership === 'writer-held') {
+            ws.send(JSON.stringify({ type: 'error', code: 'CHAT_SESSION_ACTIVE', retryable: true,
+              message: 'Codex is still releasing this thread. Wait for its writer to exit, then reconnect.' }));
+            return;
+          }
           if (hasActiveCodexShellSession(sessionId ?? '', resumeSessionId)) {
             ws.send(JSON.stringify({ type: 'error', code: 'SHELL_SESSION_ACTIVE', message: 'This Codex thread already has a Shell in another workspace. End that Shell before switching.' }));
             return;
@@ -687,6 +741,7 @@ export function handleShellConnection(
           data,
           dependencies,
           resolvedProjectPath,
+          resumeSessionId,
         );
         const claudeColorScheme = claudeFollowsAppTheme ? colorScheme : null;
         const shell = os.platform() === 'win32' ? 'powershell.exe' : 'bash';
@@ -723,6 +778,7 @@ export function handleShellConnection(
           sessionId,
           provider: isPlainShell ? 'plain-shell' : provider,
           providerSessionId: resumeSessionId || null,
+          codexHome: process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'),
           terminating: false,
           claudeColorScheme,
         });
@@ -904,10 +960,13 @@ export function handleShellConnection(
           })
         );
       }
+    } finally {
+      if (initializingThisMessage) initializationPending = false;
     }
   });
 
   ws.on('close', () => {
+    connectionClosed = true;
     if (!ptySessionKey) {
       return;
     }

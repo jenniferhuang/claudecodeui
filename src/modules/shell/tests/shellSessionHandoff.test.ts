@@ -79,6 +79,70 @@ describe('Codex Shell handoff', () => {
     view.unmount();
   });
 
+  it.each(['CHAT_SESSION_ACTIVE', 'SHELL_SESSION_ACTIVE'])(
+    'allows explicit Connect retry after %s rejects initialization without disrupting another provider',
+    (code) => {
+      const view = renderConnection();
+      const automatic = FakeSocket.instances[0];
+      act(() => { automatic.open(); vi.runOnlyPendingTimers(); });
+      act(() => { automatic.onmessage?.({ data: JSON.stringify({ type: 'session_unavailable' }) }); });
+      act(() => { view.result.current.connectToShell(); });
+      const rejected = FakeSocket.instances[1];
+      act(() => { rejected.open(); vi.runOnlyPendingTimers(); });
+      expect(rejected.sent[0]).toMatchObject({ attachOnly: false, forceRestart: false });
+
+      const otherView = renderConnection('opencode');
+      const other = FakeSocket.instances[2];
+      act(() => { other.open(); vi.runOnlyPendingTimers(); });
+      view.clearTerminalScreen.mockClear();
+      act(() => { rejected.onmessage?.({ data: JSON.stringify({
+        type: 'error', code, message: 'Wait for this session to become available, then reconnect.',
+      }) }); });
+
+      expect(view.result.current.isConnected).toBe(false);
+      expect(view.result.current.isConnecting).toBe(false);
+      expect(view.wsRef.current).toBeNull();
+      expect(rejected.readyState).toBe(3);
+      expect(view.write.mock.calls.flat().join('')).toContain('then reconnect');
+      expect(view.clearTerminalScreen).not.toHaveBeenCalled();
+      expect(FakeSocket.instances).toHaveLength(3);
+      expect(rejected.sent.some((frame) => frame.type === 'terminate')).toBe(false);
+      expect(otherView.result.current.isConnected).toBe(true);
+      expect(otherView.wsRef.current).toBe(other);
+      expect(other.readyState).toBe(1);
+
+      act(() => { view.result.current.connectToShell(); });
+      const retry = FakeSocket.instances[3];
+      act(() => { retry.open(); vi.runOnlyPendingTimers(); });
+      expect(retry.sent[0]).toMatchObject({
+        type: 'init', attachOnly: false, forceRestart: false, sessionId: 'app-session',
+      });
+      act(() => { rejected.onclose?.(); });
+      expect(view.result.current.isConnected).toBe(true);
+      expect(view.wsRef.current).toBe(retry);
+      act(() => { other.onmessage?.({ data: JSON.stringify({ type: 'output', data: 'unrelated output' }) }); });
+      expect(otherView.write).toHaveBeenCalledWith('unrelated output');
+      view.unmount();
+      otherView.unmount();
+    },
+  );
+
+  it('preserves attached terminal or observer sockets when an ordinary error is reported', () => {
+    const view = renderConnection();
+    const socket = FakeSocket.instances[0];
+    act(() => { socket.open(); vi.runOnlyPendingTimers(); });
+    act(() => { socket.onmessage?.({ data: JSON.stringify({
+      type: 'error', message: 'This socket cannot control the current terminal.',
+    }) }); });
+    expect(view.result.current.isConnected).toBe(true);
+    expect(view.wsRef.current).toBe(socket);
+    expect(socket.readyState).toBe(1);
+    expect(view.clearTerminalScreen).not.toHaveBeenCalled();
+    act(() => { socket.onmessage?.({ data: JSON.stringify({ type: 'output', data: 'retained terminal' }) }); });
+    expect(view.write).toHaveBeenCalledWith('retained terminal');
+    view.unmount();
+  });
+
   it('never sends a delayed init after the user disconnects', () => {
     const view = renderConnection();
     const socket = FakeSocket.instances[0];

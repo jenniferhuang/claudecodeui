@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
@@ -16,6 +16,8 @@ if (process.platform === 'win32') throw new Error('This PTY signal check require
 const cli = createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js');
 const quote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
 const root = await mkdtemp(path.join(tmpdir(), 'cloudcli-offline-history-'));
+const codexHome = path.join(root, '.codex');
+await mkdir(codexHome);
 const localRequests = [];
 const model = createServer(async (req, res) => {
   const chunks = []; for await (const chunk of req) chunks.push(chunk);
@@ -36,8 +38,8 @@ const model = createServer(async (req, res) => {
   res.end();
 });
 model.listen(0,'127.0.0.1'); await once(model,'listening');
-await writeFile(path.join(root,'config.toml'),`model = "offline-test"\nmodel_provider = "offline"\ncheck_for_update_on_startup = false\n[model_providers.offline]\nname = "Offline diagnostics"\nbase_url = "http://127.0.0.1:${model.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects."${root}"]\ntrust_level = "trusted"\n`);
-const env = {...process.env,CODEX_HOME:root,NO_PROXY:'127.0.0.1,localhost',TERM:'xterm-256color',PATH:process.env.PATH};
+await writeFile(path.join(codexHome,'config.toml'),`model = "offline-test"\nmodel_provider = "offline"\ncheck_for_update_on_startup = false\n[model_providers.offline]\nname = "Offline diagnostics"\nbase_url = "http://127.0.0.1:${model.address().port}/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n[projects."${root}"]\ntrust_level = "trusted"\n`);
+const env = {...process.env,HOME:root,CODEX_HOME:codexHome,NO_PROXY:'127.0.0.1,localhost',TERM:'xterm-256color',PATH:process.env.PATH};
 const children = new Set();
 const timeout = (promise, ms, name) => Promise.race([promise,new Promise((_,reject)=>{const timer=setTimeout(()=>reject(new Error(`${name} timeout`)),ms);timer.unref();})]);
 async function appServer(run) {
@@ -66,6 +68,20 @@ try {
   return id;
  });
  const history=()=>appServer(async ({call})=>{const r=await call('thread/resume',{threadId,cwd:root,model:'offline-test',approvalPolicy:'never',sandbox:'read-only'});if(r.error)return r; const read=await call('thread/read',{threadId,includeTurns:true});return {id:r.result.thread.id,marker:JSON.stringify(read).includes('CloudCLI offline history marker'),sdkMarker:JSON.stringify(read).includes('CloudCLI SDK handoff marker')};});
+ const siblingId = await appServer(async ({call,event})=>{
+  const started=await call('thread/start',{cwd:root,model:'offline-test',approvalPolicy:'never',sandbox:'read-only',persistExtendedHistory:true});
+  assert.ok(started.result,JSON.stringify(started));const id=started.result.thread.id;
+  const turn=await call('turn/start',{threadId:id,input:[{type:'text',text:'CloudCLI independent sibling marker'}]});assert.ok(turn.result,JSON.stringify(turn));
+  const completed=await event('turn/completed');assert.equal(completed.params.turn.status,'completed');return id;
+ });
+ async function checkCloudCliHistory(phase) {
+  const child=spawn(process.execPath,['--import','tsx','scripts/verify-codex-cloudcli-history.mts',threadId,siblingId,phase],{cwd:process.cwd(),env:{...env,DATABASE_PATH:path.join(root,'cloudcli-fixture.db'),CLOUDCLI_OFFLINE_FIXTURE_ROOT:root,TSX_TSCONFIG_PATH:path.resolve('server/tsconfig.json')},stdio:['ignore','pipe','pipe']});
+  children.add(child);let output='';let stderr='';child.stdout.on('data',data=>{output+=data;});child.stderr.on('data',data=>{stderr+=data;});
+  const [code]=await timeout(once(child,'close'),20000,'CloudCLI discovery/history');children.delete(child);
+  assert.equal(code,0,output+'\n'+stderr);
+  const line=output.split('\n').find(line=>line.startsWith('CLOUDCLI_HISTORY_CHECK '));assert.ok(line,output);return JSON.parse(line.slice('CLOUDCLI_HISTORY_CHECK '.length));
+ }
+ report.cloudcli_before_shell=await checkCloudCliHistory('before-shell');
  const baseline=await history(); assert.equal(baseline.marker,true,JSON.stringify(baseline));report.initial_history_preserved=true;
  terminal=pty.spawn('bash',['-c',`exec ${quote(process.execPath)} ${quote(cli)} --no-daemon resume "${threadId}" --sandbox read-only --ask-for-approval never`],{env,cwd:root,cols:110,rows:34,name:'xterm-256color'});
  const terminalExit=new Promise(resolve=>terminal.onExit(resolve));
@@ -79,7 +95,7 @@ try {
  const thread=codex.resumeThread(threadId,{workingDirectory:root,skipGitRepoCheck:true,sandboxMode:'read-only',approvalPolicy:'never',model:'offline-test'});
  const result=await timeout(thread.run('CloudCLI SDK handoff marker',{signal:AbortSignal.timeout(12000)}),15000,'SDK run');
  assert.match(result.finalResponse,/Offline fixture preserved/); const final=await history();assert.equal(final.marker,true);assert.equal(final.sdkMarker,true);
- report.sdk_resumed_same_history=true; report.local_fixture_requests=localRequests; console.log(JSON.stringify(report));
+ report.sdk_resumed_same_history=true; report.cloudcli_after_sdk=await checkCloudCliHistory('after-sdk'); report.local_fixture_requests=localRequests; console.log(JSON.stringify(report));
 } finally {
  if(terminal)terminal.kill();for(const child of children)child.kill('SIGKILL');model.close();await rm(root,{recursive:true,force:true});
 }

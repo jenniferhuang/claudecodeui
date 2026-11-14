@@ -122,15 +122,26 @@ export function useShellConnection({
       }
 
       if (message.type === 'error') {
-        // The server sends this instead of spawning a PTY, then keeps the
-        // socket open — so without writing it out the terminal just stays
-        // blank forever under a green "connected" dot. Deliberately not
-        // closing the socket: `onclose` clears the screen and would erase
-        // the very message being surfaced here.
+        // Error frames need visible output. Keep ordinary terminal/observer
+        // errors connected; only the explicit initialization rejections below
+        // retire a socket without clearing the explanation.
         const detail = typeof message.message === 'string' && message.message
           ? message.message
           : 'Shell error';
         terminalRef.current?.write(`\r\n\x1b[31m${detail}\x1b[0m\r\n`);
+        const code = 'code' in message ? message.code : undefined;
+        if (code === 'CHAT_SESSION_ACTIVE' || code === 'SHELL_SESSION_ACTIVE') {
+          // These errors reject initialization before any PTY is attached.
+          // Retire only this socket, keep its explanation, and allow Connect
+          // to retry explicitly once the competing session has finished.
+          suppressAutoConnectRef.current = true;
+          closeSocket();
+          setIsConnected(false);
+          setIsConnecting(false);
+          setClaudeLaunchColorScheme(null);
+          connectingRef.current = false;
+          forceRestartOnInitRef.current = false;
+        }
         return;
       }
 
