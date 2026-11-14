@@ -423,29 +423,30 @@ test('two text parts are joined with a paragraph break, streamed as its own delt
 });
 
 test('the fork id is registered while the answer runs and leaves the registry only after its delete finished', async () => {
+  const deleteGateDirectory = await mkdtemp(path.join(tempRoot, 'delete-gate-'));
+  const deleteReleaseFile = path.join(deleteGateDirectory, 'release');
   const seenWhileAnswering: boolean[] = [];
-  const asking = startAsk(scenario(), () => {
+  const asking = startAsk(scenario({ deleteDelayMs: 0, deleteReleaseFile }), () => {
     seenWhileAnswering.push(registry.has(FORK_SESSION));
   });
 
-  // Sample the registry while the fake is still running the delete.
+  // Hold deletion across the async log read; a snapshot cannot date a later
+  // registry sample once the server is free to complete DELETE independently.
   const duringDelete: boolean[] = [];
-  let done = false;
-  const sampling = (async () => {
-    while (!done) {
-      const log = await asking.readLog();
-      if (log.some(isForkDelete) && !log.some((entry) => entry.deleteFinished === FORK_SESSION)) {
-        duringDelete.push(registry.has(FORK_SESSION));
-      }
-      await settle(10);
-    }
-  })();
   let result: Awaited<ReturnType<Asking['finish']>>;
   try {
-    result = await asking.finish();
+    await waitFor(async () => {
+      const log = await asking.readLog();
+      if (!log.some(isForkDelete)) {
+        return false;
+      }
+      assert.ok(!log.some((entry) => entry.deleteFinished === FORK_SESSION), 'the fake delete waits for explicit release');
+      return true;
+    }, 'the fork delete was requested');
+    duringDelete.push(registry.has(FORK_SESSION));
   } finally {
-    done = true;
-    await sampling;
+    await writeFile(deleteReleaseFile, '');
+    result = await asking.finish();
   }
 
   assert.ok(seenWhileAnswering.length > 0, 'the answer streamed');
