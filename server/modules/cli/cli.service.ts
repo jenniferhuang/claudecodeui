@@ -7,8 +7,10 @@ import type {
   CliOutput,
   CliPackageMetadata,
   SandboxCommandService,
-} from '@/shared/types.js';
-import { terminalTextStyles } from '@/shared/utils.js';
+} from '@/shared/index.js';
+import { terminalTextStyles } from '@/shared/index.js';
+
+import { parseCliArguments } from './cli-arguments.service.js';
 
 type CliServiceDependencies = {
   applicationRoot: string;
@@ -25,47 +27,6 @@ type CliServiceDependencies = {
   startBrowserUseMcp(): Promise<void>;
 };
 
-type ParsedCliArguments = {
-  command: string;
-  options: {
-    serverPort?: string;
-    databasePath?: string;
-  };
-  remainingArguments: string[];
-};
-
-function parseCliArguments(argumentsList: string[]): ParsedCliArguments {
-  const parsedArguments: ParsedCliArguments = {
-    command: 'start',
-    options: {},
-    remainingArguments: [],
-  };
-
-  for (let argumentIndex = 0; argumentIndex < argumentsList.length; argumentIndex += 1) {
-    const argument = argumentsList[argumentIndex];
-    if (argument === '--port' || argument === '-p') {
-      parsedArguments.options.serverPort = argumentsList[++argumentIndex];
-    } else if (argument.startsWith('--port=')) {
-      parsedArguments.options.serverPort = argument.slice('--port='.length);
-    } else if (argument === '--database-path') {
-      parsedArguments.options.databasePath = argumentsList[++argumentIndex];
-    } else if (argument.startsWith('--database-path=')) {
-      parsedArguments.options.databasePath = argument.slice('--database-path='.length);
-    } else if (argument === '--help' || argument === '-h') {
-      parsedArguments.command = 'help';
-    } else if (argument === '--version' || argument === '-v') {
-      parsedArguments.command = 'version';
-    } else if (!argument.startsWith('-')) {
-      parsedArguments.command = argument;
-      if (argument === 'sandbox') {
-        parsedArguments.remainingArguments = argumentsList.slice(argumentIndex + 1);
-        break;
-      }
-    }
-  }
-
-  return parsedArguments;
-}
 
 function isNewerVersion(candidateVersion: string, currentVersion: string): boolean {
   const candidateParts = candidateVersion.split('.').map(Number);

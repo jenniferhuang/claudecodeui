@@ -30,8 +30,8 @@ const configPath = path.join(configDirectory, 'filesystem-policy.json');
 await writeFile(configPath, JSON.stringify({
   version: 1,
   writableRoots: [
-    path.join(homedir(), '.hermes'),
     path.join(homedir(), 'Projects', 'Integrates'),
+    path.join(homedir(), '.hermes'),
   ],
 }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
 console.log(configPath);
@@ -39,7 +39,8 @@ NODE
 ```
 
 The example refuses to overwrite an existing policy. Edit that file using your
-normal local editor if it already exists. To use another policy location, set
+normal local editor if it already exists. The first writable root is the folder
+picker's default location. To use another policy location, set
 `CLOUDCLI_FILESYSTEM_POLICY` to its absolute path in the server's launch
 environment. An explicitly configured missing or malformed policy fails startup;
 CloudCLI does not silently drop the restriction. Configured policies on

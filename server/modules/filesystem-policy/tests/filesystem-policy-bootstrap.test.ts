@@ -111,6 +111,110 @@ test('policy data cannot live inside writable project or operational locations',
   }), /does not match/);
 });
 
+test('an editable policy symlink or editable parent alias cannot select the next-start policy', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  const editableLink = path.join(fixture.first, 'policy.json');
+  fs.symlinkSync(fixture.configPath, editableLink);
+  const parentAlias = path.join(fixture.homeDirectory, 'readonly-looking-parent');
+  fs.symlinkSync(fixture.first, parentAlias);
+  const lockedDirectoryLink = path.join(fixture.first, 'locked-policy-directory');
+  fs.symlinkSync(path.dirname(fixture.configPath), lockedDirectoryLink);
+  const hiddenTargetChain = path.join(fixture.homeDirectory, 'readonly-looking-target-chain');
+  fs.symlinkSync(lockedDirectoryLink, hiddenTargetChain);
+  const relativeTargetChain = path.join(fixture.homeDirectory, 'readonly-looking-relative-chain');
+  fs.symlinkSync(path.relative(fixture.homeDirectory, lockedDirectoryLink), relativeTargetChain);
+  let launches = 0;
+  for (const entry of [
+    editableLink,
+    path.join(parentAlias, 'policy.json'),
+    path.join(parentAlias, 'locked-policy-directory', path.basename(fixture.configPath)),
+    path.join(hiddenTargetChain, path.basename(fixture.configPath)),
+    path.join(relativeTargetChain, path.basename(fixture.configPath)),
+  ]) {
+    await assert.rejects(initializeFilesystemPolicy({
+      environment: { CLOUDCLI_FILESYSTEM_POLICY: entry }, homeDirectory: fixture.homeDirectory,
+      platform: 'darwin', launch: () => { launches += 1; },
+    }), /outside writable/);
+  }
+  assert.equal(launches, 0);
+
+  const safeLink = path.join(fixture.homeDirectory, 'readonly-policy.json');
+  fs.symlinkSync(fixture.configPath, safeLink);
+  let capture: { profilePath: string; environment: NodeJS.ProcessEnv } | undefined;
+  await initializeFilesystemPolicy({
+    environment: { CLOUDCLI_FILESYSTEM_POLICY: safeLink }, homeDirectory: fixture.homeDirectory,
+    platform: 'darwin', launch: (profilePath, environment) => { capture = { profilePath, environment }; },
+  });
+  assert.ok(capture);
+  assert.equal(capture.environment.CLOUDCLI_FILESYSTEM_POLICY, safeLink);
+  assert.ok(fs.readFileSync(capture.profilePath, 'utf8').includes(`(literal ${JSON.stringify(safeLink)})`));
+});
+
+test('relative policy links resolve parent segments physically and cyclic links fail closed', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  const safeDirectory = path.join(fixture.homeDirectory, 'readonly-links');
+  fs.mkdirSync(safeDirectory);
+  const safeAlias = path.join(safeDirectory, 'policy.json');
+  fs.symlinkSync(path.relative(safeDirectory, fixture.configPath), safeAlias);
+  let launches = 0;
+  await assert.doesNotReject(initializeFilesystemPolicy({
+    environment: { CLOUDCLI_FILESYSTEM_POLICY: safeAlias }, homeDirectory: fixture.homeDirectory,
+    platform: 'darwin', launch: () => { launches += 1; },
+  }));
+  const loopA = path.join(safeDirectory, 'loop-a');
+  const loopB = path.join(safeDirectory, 'loop-b');
+  fs.symlinkSync('loop-b', loopA);
+  fs.symlinkSync('loop-a', loopB);
+  await assert.rejects(initializeFilesystemPolicy({
+    environment: { CLOUDCLI_FILESYSTEM_POLICY: loopA }, homeDirectory: fixture.homeDirectory,
+    platform: 'darwin', launch: () => { launches += 1; },
+  }), /Too many symbolic links/);
+  assert.equal(launches, 1);
+});
+
+test('runtime filename exceptions cannot serve as mutable policy selectors', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  let launches = 0;
+  for (const relative of ['.cloudcli/claude-shell-theme-light.json', '.codex/state_5.sqlite']) {
+    const alias = path.join(fixture.homeDirectory, relative);
+    fs.mkdirSync(path.dirname(alias), { recursive: true });
+    fs.symlinkSync(fixture.configPath, alias);
+    await assert.rejects(initializeFilesystemPolicy({
+      environment: { CLOUDCLI_FILESYSTEM_POLICY: alias }, homeDirectory: fixture.homeDirectory,
+      platform: 'darwin', launch: () => { launches += 1; },
+    }), /outside writable/);
+  }
+  assert.equal(launches, 0);
+});
+
+test('services sharing a JSON policy keep distinct profiles for distinct database grants', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  fixture.writeConfig();
+  const captures: Array<{ profilePath: string; environment: NodeJS.ProcessEnv }> = [];
+  const launch = (profilePath: string, environment: NodeJS.ProcessEnv) => { captures.push({ profilePath, environment }); };
+  await initializeFilesystemPolicy({
+    environment: { DATABASE_PATH: path.join(fixture.homeDirectory, 'first-auth.db') },
+    homeDirectory: fixture.homeDirectory, platform: 'darwin', launch,
+  });
+  const firstProfile = fs.readFileSync(captures[0].profilePath, 'utf8');
+  await initializeFilesystemPolicy({
+    environment: { DATABASE_PATH: path.join(fixture.homeDirectory, 'second-auth.db') },
+    homeDirectory: fixture.homeDirectory, platform: 'darwin', launch,
+  });
+  assert.notEqual(captures[0].profilePath, captures[1].profilePath);
+  assert.equal(fs.readFileSync(captures[0].profilePath, 'utf8'), firstProfile);
+  await assert.rejects(initializeFilesystemPolicy({
+    environment: captures[0].environment, homeDirectory: fixture.homeDirectory, platform: 'darwin',
+  }), /marker is set/); // Content attestation succeeds; this test parent is intentionally not sandboxed.
+});
+
 test('state symlinks cannot grant writes to an otherwise review-only location on restart', async (t) => {
   for (const stateDirectory of ['.codex/sessions', '.cloudcli/assets']) {
     const fixture = createFixture();
@@ -162,9 +266,11 @@ test('native macOS policy and inherited bootstrap permit edits only in project a
   const reviewFile = path.join(fixture.review, 'review.txt');
   fs.writeFileSync(reviewFile, 'unchanged');
   fs.symlinkSync(fixture.review, path.join(fixture.first, 'escape'));
+  const safePolicyAlias = path.join(fixture.homeDirectory, 'readonly-policy.json');
+  fs.symlinkSync(fixture.configPath, safePolicyAlias);
   let capture: { profilePath: string; environment: NodeJS.ProcessEnv } | undefined;
   await initializeFilesystemPolicy({
-    environment: { ...process.env }, homeDirectory: fixture.homeDirectory,
+    environment: { ...process.env, CLOUDCLI_FILESYSTEM_POLICY: safePolicyAlias }, homeDirectory: fixture.homeDirectory,
     launch: (profilePath, environment) => { capture = { profilePath, environment }; },
   });
   assert.ok(capture);

@@ -27,6 +27,44 @@ function containsPath(root: string, candidate: string): boolean {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
+function configurationEntrypoints(requestedPath: string) {
+  const root = path.parse(requestedPath).root;
+  let components = requestedPath.slice(root.length).split(path.sep);
+  let current = root;
+  let currentIsDirectory = true;
+  let expansions = 0;
+  const entries: string[] = [];
+  const symlinks: string[] = [];
+  while (components.length > 0) {
+    const component = components.shift()!;
+    if (component === '') continue;
+    if (!currentIsDirectory) throw new Error('Filesystem policy path traverses a non-directory');
+    if (component === '.') continue;
+    if (component === '..') {
+      current = path.dirname(current);
+      continue;
+    }
+    const entry = path.join(current, component);
+    entries.push(entry);
+    const entryStats = fs.lstatSync(entry);
+    if (entryStats.isSymbolicLink()) {
+      symlinks.push(entry);
+      if (++expansions > 40) throw new Error('Too many symbolic links in filesystem policy path');
+      const target = fs.readlinkSync(entry);
+      const targetRoot = path.parse(target).root;
+      // Expand the target itself, not realpathSync(entry): that call could
+      // jump over another mutable symlink hidden inside this link's target.
+      // Keep .. in the queue so it is resolved after preceding links.
+      if (targetRoot) current = targetRoot;
+      components = [...target.slice(targetRoot.length).split(path.sep), ...components];
+      continue;
+    }
+    current = entry;
+    currentIsDirectory = entryStats.isDirectory();
+  }
+  return { entries, symlinks, finalEntry: current };
+}
+
 function parseConfiguration(contents: string, homeDirectory: string) {
   const config: unknown = JSON.parse(contents);
   if (!config || typeof config !== 'object' || Array.isArray(config)) {
@@ -89,7 +127,13 @@ function operationalWritePaths(homeDirectory: string, environment: NodeJS.Proces
     files.push(database, `${database}-wal`, `${database}-shm`, `${database}-journal`);
   }
   const rootParents = [...new Set([...directories, ...files].map((entry) => path.dirname(entry)))];
-  return { directories, files, rootParents };
+  const homeRegex = regexQuote(homeDirectory);
+  const patterns = [
+    `^${homeRegex}/[.]codex/[a-z_]+_[0-9]+[.]sqlite(-wal|-shm|-journal)?$`,
+    `^${homeRegex}/[.]claude[.]json([.].*)?$`,
+    `^${homeRegex}/[.]cloudcli/claude-shell-theme-[a-z-]+[.]json([.][0-9]+[.]tmp)?$`,
+  ];
+  return { directories, files, rootParents, patterns };
 }
 
 function regexQuote(value: string): string {
@@ -105,7 +149,6 @@ function seatbeltRegex(pattern: string): string {
 }
 
 function renderProfile(
-  homeDirectory: string,
   writableRoots: string[],
   runtimeDirectory: string,
   operational: ReturnType<typeof operationalWritePaths>,
@@ -116,10 +159,7 @@ function renderProfile(
   ].map((entry) => `(subpath ${JSON.stringify(entry)})`);
   terms.push(...operational.files.map((entry) => `(literal ${JSON.stringify(entry)})`));
   terms.push('(literal "/dev/null")', '(literal "/dev/tty")', '(literal "/dev/ptmx")', '(regex #"^/dev/ttys[0-9]+$")');
-  const homeRegex = regexQuote(homeDirectory);
-  terms.push(`(regex ${seatbeltRegex(`^${homeRegex}/[.]codex/[a-z_]+_[0-9]+[.]sqlite(-wal|-shm|-journal)?$`)})`);
-  terms.push(`(regex ${seatbeltRegex(`^${homeRegex}/[.]claude[.]json([.].*)?$`)})`);
-  terms.push(`(regex ${seatbeltRegex(`^${homeRegex}/[.]cloudcli/claude-shell-theme-[a-z-]+[.]json([.][0-9]+[.]tmp)?$`)})`);
+  terms.push(...operational.patterns.map((pattern) => `(regex ${seatbeltRegex(pattern)})`));
   return [
     '; Generated CloudCLI filesystem policy: project data is writable only under writableRoots.',
     '; Operational exceptions permit databases, transcripts, auth refresh, caches and terminal devices.',
@@ -175,9 +215,14 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
   }
   const requestedPath = configuredPath ?? path.join(homeDirectory, '.config', 'cloudcli', 'filesystem-policy.json');
   let configPath: string;
+  let entrypoints: ReturnType<typeof configurationEntrypoints>;
   let contents: string;
   try {
-    configPath = fs.realpathSync(requestedPath);
+    // Validate every physical path-component entry. Following only the final
+    // target or its parent can hide a mutable intermediate symlink in a
+    // writable tree when a second symlink leads back to a locked directory.
+    entrypoints = configurationEntrypoints(requestedPath);
+    configPath = entrypoints.finalEntry;
     contents = fs.readFileSync(configPath, 'utf8');
   } catch (error) {
     if (configuredPath === undefined && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -188,18 +233,27 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
     throw new Error('Configured CloudCLI filesystem policy requires macOS sandbox-exec; refusing an unprotected start');
   }
   const operational = operationalWritePaths(homeDirectory, environment, writableRoots);
-  const digest = createHash('sha256').update(JSON.stringify({ configPath, writableRoots, runtimeDirectory })).digest('hex').slice(0, 16);
+  const protectedConfigPaths = [...new Set([path.resolve(requestedPath), ...entrypoints.symlinks, entrypoints.finalEntry, configPath])];
+  // Hash the actual policy semantics, excluding only its own not-yet-known
+  // filename. Distinct runtime/DB grants must not overwrite another service's
+  // profile or break that service's inherited-bootstrap attestation.
+  const baseProfile = renderProfile(writableRoots, runtimeDirectory, operational, protectedConfigPaths);
+  const digest = createHash('sha256').update(baseProfile).digest('hex').slice(0, 16);
   const profilePath = path.join(path.dirname(configPath), `filesystem-policy-${digest}.sb`);
-  for (const protectedPath of [configPath, profilePath]) {
+  const protectedPaths = [...protectedConfigPaths, profilePath];
+  for (const protectedPath of [...entrypoints.entries, ...protectedPaths]) {
     if ([...writableRoots, runtimeDirectory, ...operational.directories].some((root) => containsPath(root, protectedPath))
-      || operational.files.includes(protectedPath)) {
+      || operational.files.includes(protectedPath)
+      || operational.patterns.some((pattern) => new RegExp(pattern).test(protectedPath))) {
       throw new Error('Filesystem policy and generated profile must be outside writable project and runtime locations');
     }
   }
-  const profile = renderProfile(homeDirectory, writableRoots, runtimeDirectory, operational, [configPath, profilePath]);
+  const profile = renderProfile(writableRoots, runtimeDirectory, operational, protectedPaths);
   const childEnvironment = {
     ...environment,
-    CLOUDCLI_FILESYSTEM_POLICY: configPath,
+    // Keep a safe read-only alias stable across re-exec so both processes
+    // protect the same entrypoints and attest the same generated profile.
+    CLOUDCLI_FILESYSTEM_POLICY: requestedPath,
     CLOUDCLI_PROCESS_SANDBOX: '1',
     CLOUDCLI_SANDBOX_ACTIVE: '1',
     CLOUDCLI_SANDBOX_PROFILE: profilePath,
