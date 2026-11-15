@@ -176,11 +176,11 @@ async function desktopFixture(t: TestContext) {
   const lock = path.join(f.lockDirectory, 'native-one.lock');
   await writeFile(lock, '');
   const parentPid = 43100;
-  const processStart = 'Sat Nov 14 12:00:00 2026';
+  const processStart = 1_790_000_000;
   const state = {
     flock: 'held\n', inventoryPid: pid, extraPid: 0, bundleId: 'com.openai.codex',
     version: 'codex-cli 0.169.0-alpha.11.1\n',
-    childStart: processStart, command: `${executable} app-server --analytics-default-enabled`,
+    childStart: processStart, childStartMicroseconds: 123456, command: `${executable} app-server --analytics-default-enabled`,
     childTextPath: executable, versionCalls: [] as string[],
   };
   const fileRecord = async (owner: number, fd: string, file: string) => {
@@ -188,7 +188,19 @@ async function desktopFixture(t: TestContext) {
     return `p${owner}\nf${fd}\ntREG\nD0x${info.dev.toString(16)}\ni${info.ino}\nn${file}\n`;
   };
   const runFile = async (file: string, args: string[]) => {
-    if (file === '/usr/bin/perl') return { stdout: state.flock };
+    if (file === '/usr/bin/perl') {
+      if (/^[0-9]+$/.test(args.at(-1) ?? '')) {
+        const inspectedPid = Number(args.at(-1));
+        return { stdout: JSON.stringify({
+          pid: inspectedPid, parentPid: inspectedPid === pid ? parentPid : 1,
+          startSeconds: inspectedPid === pid ? state.childStart : processStart,
+          startMicroseconds: inspectedPid === pid ? state.childStartMicroseconds : 123450,
+          executable: inspectedPid === pid ? executable : parentExecutable,
+          argv: inspectedPid === pid ? state.command.split(' ') : [parentExecutable],
+        }) };
+      }
+      return { stdout: state.flock };
+    }
     if (file === '/usr/bin/plutil') {
       assert.deepEqual(args, ['-extract', 'CFBundleIdentifier', 'raw', '-o', '-', plist]);
       return { stdout: state.bundleId };
@@ -198,13 +210,7 @@ async function desktopFixture(t: TestContext) {
       state.versionCalls.push(file);
       return { stdout: state.version };
     }
-    if (file === '/bin/ps') {
-      const inspectedPid = Number(args[3]);
-      if (args[1] === 'ppid=,lstart=') return { stdout: inspectedPid === pid
-        ? `${parentPid} ${state.childStart}\n` : `1 ${processStart}\n` };
-      if (args[1] === 'comm=') return { stdout: inspectedPid === pid ? `${executable}\n` : `${parentExecutable}\n` };
-      if (args[1] === 'args=') return { stdout: state.command };
-    }
+    if (file === '/bin/ps') throw Object.assign(new Error('sandbox denies setuid ps'), { code: 'EPERM' });
     if (file === '/usr/sbin/lsof') {
       if (args.includes('-d')) {
         const inspectedPid = Number(args[args.indexOf('-p') + 1]);
@@ -273,7 +279,7 @@ test('Desktop ownership becomes unverified when process identity, flock state or
       const result = await f.runFile(file, args);
       if (file === f.executable) {
         versionRead = true;
-        if (scenario === 'pid-reused') f.state.childStart = 'Sat Nov 14 12:01:00 2026';
+        if (scenario === 'pid-reused') f.state.childStart += 1;
         if (scenario === 'released') f.state.flock = 'clear\n';
         if (scenario === 'new-opener') f.state.extraPid = 43211;
       }
@@ -373,5 +379,124 @@ test('Desktop startup cannot smuggle model, provider, transport or unknown overr
       platform: 'darwin', desktopApplicationPath: f.applicationPath, runFile: f.runFile,
     }), null, args);
     assert.deepEqual(f.state.versionCalls, [], args);
+  }
+});
+
+
+test('Desktop owner inspection survives Seatbelt ps EPERM without executing ps or weakening ownership checks', async (t) => {
+  const f = await desktopFixture(t);
+  const helpers: string[] = [];
+  const owner = await inspectCodexDesktopOwner('native-one', f.home, {
+    platform: 'darwin', desktopApplicationPath: f.applicationPath,
+    runFile: async (file, args) => { helpers.push(file); return f.runFile(file, args); },
+  });
+  assert.equal(owner?.pid, pid);
+  assert.equal(helpers.includes('/bin/ps'), false);
+  assert.deepEqual(f.state.versionCalls, [f.executable]);
+});
+
+test('malformed, reused and missing native process metadata cannot authorize Desktop execution', async (t) => {
+  for (const scenario of ['json', 'pid', 'parent', 'seconds', 'microseconds', 'executable', 'argv', 'environment', 'missing'] as const) {
+    const f = await desktopFixture(t);
+    const runFile = async (file: string, args: string[]) => {
+      const result = await f.runFile(file, args);
+      if (file !== '/usr/bin/perl' || !/^[0-9]+$/.test(args.at(-1) ?? '')) return result;
+      if (scenario === 'missing') throw Object.assign(new Error('missing system helper'), { code: 'ENOENT' });
+      if (scenario === 'json') return { stdout: '{truncated' };
+      const identity = JSON.parse(result.stdout);
+      if (scenario === 'pid') identity.pid += 1;
+      if (scenario === 'parent') identity.parentPid = identity.pid;
+      if (scenario === 'seconds') identity.startSeconds = '1790000000';
+      if (scenario === 'microseconds') identity.startMicroseconds = 1000000;
+      if (scenario === 'executable') identity.executable = '/tmp/unverified-binary';
+      if (scenario === 'argv') identity.argv = [f.executable, 123];
+      if (scenario === 'environment') identity.environment = { INJECTED: 'untrusted' };
+      return { stdout: JSON.stringify(identity) };
+    };
+    assert.equal(await inspectCodexDesktopOwner('native-one', f.home, {
+      platform: 'darwin', desktopApplicationPath: f.applicationPath, runFile,
+    }), null, scenario);
+    assert.deepEqual(f.state.versionCalls, [], scenario);
+  }
+});
+
+test('microsecond process-start and argv changes during Desktop inspection fail closed', async (t) => {
+  for (const scenario of ['microseconds', 'argv'] as const) {
+    const f = await desktopFixture(t);
+    const runFile = async (file: string, args: string[]) => {
+      const result = await f.runFile(file, args);
+      if (file === f.executable) {
+        if (scenario === 'microseconds') f.state.childStartMicroseconds += 1;
+        else f.state.command = `${f.executable} app-server`;
+      }
+      return result;
+    };
+    assert.equal(await inspectCodexDesktopOwner('native-one', f.home, {
+      platform: 'darwin', desktopApplicationPath: f.applicationPath, runFile,
+    }), null, scenario);
+  }
+});
+
+test('Desktop process probes ignore inherited Perl module injection without changing provider environment', async (t) => {
+  const f = await desktopFixture(t);
+  const previous = process.env.PERL5OPT;
+  process.env.PERL5OPT = '-MCloudCLIUntrustedModule';
+  t.after(() => { if (previous === undefined) delete process.env.PERL5OPT; else process.env.PERL5OPT = previous; });
+  const nativeCalls: string[][] = [];
+  const owner = await inspectCodexDesktopOwner('native-one', f.home, {
+    platform: 'darwin', desktopApplicationPath: f.applicationPath,
+    runFile: async (file, args, options) => {
+      assert.equal(Object.keys(options.env ?? {}).some(key => key.startsWith('PERL')), false);
+      if (file === '/usr/bin/perl' && /^[0-9]+$/.test(args.at(-1) ?? '')) nativeCalls.push(args);
+      return f.runFile(file, args);
+    },
+  });
+  assert.equal(owner?.pid, pid);
+  assert.ok(nativeCalls.length >= 4);
+  assert.ok(nativeCalls.every(args => args[0] === '-T' && args[1] === '-e'));
+  assert.equal(process.env.PERL5OPT, '-MCloudCLIUntrustedModule');
+});
+
+test('native Darwin metadata remains readable inside Seatbelt and never returns the target environment', { skip: process.platform !== 'darwin' }, async (t) => {
+  const f = await desktopFixture(t);
+  let script = '';
+  assert.equal((await inspectCodexDesktopOwner('native-one', f.home, {
+    platform: 'darwin', desktopApplicationPath: f.applicationPath,
+    runFile: async (file, args) => {
+      if (file === '/usr/bin/perl' && args[0] === '-T') script = args[2];
+      return f.runFile(file, args);
+    },
+  }))?.pid, pid);
+  assert.ok(script);
+  const secret = 'CLOUDCLI_TARGET_ENVIRONMENT_MUST_NOT_BE_RETURNED';
+  const target = spawn(process.execPath, ['-e', 'process.stdout.write("ready\\n");process.stdin.resume();', 'native-argv-boundary'], {
+    env: { ...process.env, CLOUDCLI_NATIVE_IDENTITY_SECRET: secret }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const exited = once(target, 'exit');
+  t.after(async () => { target.stdin.end(); await exited; });
+  await once(target.stdout, 'data');
+  const probe = (targetPid: string) => spawnSync('/usr/bin/sandbox-exec', [
+    '-p', '(version 1)(allow default)(deny job-creation)(deny lsopen)(deny appleevent-send)(deny file-write*)',
+    '/usr/bin/perl', '-T', '-e', script, targetPid,
+  ], {
+    encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, LC_ALL: 'C', LANG: 'C', PERL5OPT: '-MCloudCLINonexistentModule', PERL5LIB: '/nonexistent-cloudcli-probe' },
+  });
+  const result = probe(String(target.pid));
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  const identity = JSON.parse(result.stdout);
+  assert.equal(identity.pid, target.pid);
+  assert.equal(identity.parentPid, process.pid);
+  assert.equal(await realpath(identity.executable), await realpath(process.execPath));
+  assert.ok(Number.isInteger(identity.startSeconds) && identity.startSeconds > 0);
+  assert.ok(Number.isInteger(identity.startMicroseconds) && identity.startMicroseconds >= 0 && identity.startMicroseconds < 1000000);
+  assert.equal(identity.argv.at(-1), 'native-argv-boundary');
+  assert.equal(result.stdout.includes(secret), false);
+  assert.deepEqual(Object.keys(identity).sort(), ['argv', 'executable', 'parentPid', 'pid', 'startMicroseconds', 'startSeconds']);
+  for (const missing of ['2147483647', 'invalid-pid']) {
+    const absent = probe(missing);
+    assert.notEqual(absent.status, 0);
+    assert.equal(absent.stdout, '');
   }
 });
