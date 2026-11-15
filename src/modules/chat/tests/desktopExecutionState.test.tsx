@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 
 import { act, renderHook } from '@testing-library/react';
-import { test, vi } from 'vitest';
+import { afterEach, test, vi } from 'vitest';
 
 import { useChatRealtimeHandlers } from '@/modules/chat/hooks/useChatRealtimeHandlers';
+import { useNativeExecutionReconciliation } from '@/modules/chat/hooks/useNativeExecutionReconciliation';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
 import { useSessionProtection } from '@/shared/hooks/useSessionProtection';
 import type { ProjectSession, ServerEvent } from '@/shared/types';
@@ -12,14 +13,22 @@ const desktopExecution = {
   state: 'uncertain', requestId: 'request-a', queueItemId: 'queue-a', turnId: null,
 } as const;
 
-const renderDesktopSession = () => {
+type DesktopSessionView = { sessionId: string; isActive?: boolean; isConnected?: boolean };
+
+const renderDesktopSession = (reconcile?: (isCurrent: () => boolean) => Promise<void>) => {
   let listener: ((event: ServerEvent) => void) | undefined;
-  const refresh = vi.fn(async () => {});
+  const refresh = vi.fn(async (_sessionId: string, _allowNetwork?: boolean) => {});
   const sessionStore = {
     appendRealtime: () => {}, getMessages: () => [], updateStreaming: () => {}, finalizeStreaming: () => {},
   } as unknown as SessionStore;
-  const hook = renderHook(({ sessionId }: { sessionId: string }) => {
+  const hook = renderHook(({ sessionId, isActive = true, isConnected = true }: DesktopSessionView) => {
     const activity = useSessionProtection();
+    const execution = activity.getSessionActivity(sessionId)?.desktopExecution;
+    useNativeExecutionReconciliation({
+      sessionId,
+      enabled: Boolean(reconcile && isActive && isConnected && execution && execution.state !== 'completed' && execution.state !== 'failed'),
+      reconcile: reconcile ?? (async () => {}),
+    });
     useChatRealtimeHandlers({
       isActive: true,
       subscribe: (fn) => { listener = fn; return () => { listener = undefined; }; },
@@ -32,9 +41,100 @@ const renderDesktopSession = () => {
       requestLatestMessages: refresh, sessionStore,
     });
     return activity;
-  }, { initialProps: { sessionId: 'session-a' } });
+  }, { initialProps: { sessionId: 'session-a' } as DesktopSessionView });
   return { ...hook, refresh, dispatch: (event: ServerEvent) => act(() => listener?.(event)) };
 };
+
+afterEach(() => vi.useRealTimers());
+
+test('a tab missing native completion silently refreshes history and stops checking after an idle acknowledgement', async () => {
+  vi.useFakeTimers();
+  const checks: string[] = [];
+  const view = renderDesktopSession(async (isCurrent) => {
+    checks.push('history');
+    await view.refresh('session-a', true);
+    if (isCurrent()) {
+      checks.push('status');
+      view.dispatch({ kind: 'chat_subscribed', sessionId: 'session-a', isProcessing: false });
+    }
+  });
+  view.dispatch({ kind: 'status', sessionId: 'session-a', canInterrupt: false, desktopExecution });
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  assert.deepEqual(checks, ['history', 'status']);
+  assert.deepEqual(view.refresh.mock.calls, [['session-a', true]]);
+  assert.equal(view.result.current.getSessionActivity('session-a'), undefined);
+  await act(() => vi.advanceTimersByTimeAsync(30_000));
+  assert.deepEqual(checks, ['history', 'status']);
+});
+
+test('silent native checks wait while Chat is inactive or disconnected and stop on unmount', async () => {
+  vi.useFakeTimers();
+  const reconcile = vi.fn(async () => {});
+  const view = renderDesktopSession(reconcile);
+  view.rerender({ sessionId: 'session-a', isActive: false });
+  view.dispatch({ kind: 'status', sessionId: 'session-a', canInterrupt: false, desktopExecution });
+  await act(() => vi.advanceTimersByTimeAsync(20_000));
+  assert.equal(reconcile.mock.calls.length, 0);
+  view.rerender({ sessionId: 'session-a', isConnected: false });
+  await act(() => vi.advanceTimersByTimeAsync(20_000));
+  assert.equal(reconcile.mock.calls.length, 0);
+  view.rerender({ sessionId: 'session-a' });
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  assert.equal(reconcile.mock.calls.length, 1);
+  assert.equal(view.result.current.getSessionActivity('session-a')?.desktopExecution?.state, 'uncertain');
+  view.unmount();
+  await act(() => vi.advanceTimersByTimeAsync(20_000));
+  assert.equal(reconcile.mock.calls.length, 1);
+});
+
+test('callback changes do not postpone native checks and a pending or failed check does not overlap its retry', async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const calls: string[] = [];
+  const callback = (label: string) => async () => {
+    calls.push(label);
+    if (calls.length === 1) {
+      await pending;
+      throw new Error('temporary history failure');
+    }
+  };
+  const view = renderHook(({ reconcile }) => useNativeExecutionReconciliation({
+    sessionId: 'session-a', enabled: true, reconcile,
+  }), { initialProps: { reconcile: callback('old') } });
+  await act(() => vi.advanceTimersByTimeAsync(5_000));
+  view.rerender({ reconcile: callback('latest') });
+  await act(() => vi.advanceTimersByTimeAsync(5_000));
+  assert.deepEqual(calls, ['latest']);
+  await act(() => vi.advanceTimersByTimeAsync(20_000));
+  assert.deepEqual(calls, ['latest']);
+  await act(async () => release());
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  assert.deepEqual(calls, ['latest', 'latest']);
+});
+
+test('a native check cancelled by navigation or hiding cannot act after its pending history refresh', async () => {
+  vi.useFakeTimers();
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  const subscriptions: string[] = [];
+  const view = renderHook(({ sessionId, enabled }) => useNativeExecutionReconciliation({
+    sessionId, enabled,
+    reconcile: async (isCurrent) => {
+      await pending;
+      if (isCurrent()) subscriptions.push(sessionId);
+    },
+  }), { initialProps: { sessionId: 'session-a', enabled: true } });
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  view.rerender({ sessionId: 'session-b', enabled: true });
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  view.rerender({ sessionId: 'session-b', enabled: false });
+  await act(async () => release());
+  assert.deepEqual(subscriptions, []);
+  view.rerender({ sessionId: 'session-b', enabled: true });
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  assert.deepEqual(subscriptions, ['session-b']);
+});
 
 test('Desktop execution status stays scoped to its session across switching and reconnect acknowledgement', () => {
   const { result, dispatch, rerender } = renderDesktopSession();

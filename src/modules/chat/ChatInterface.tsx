@@ -20,6 +20,7 @@ import { useChatProviderState } from '@/modules/chat/hooks/useChatProviderState'
 import { useScheduledMessages } from '@/modules/chat/composer/useScheduledMessages';
 import { useChatSessionState } from '@/modules/chat/hooks/useChatSessionState';
 import { useChatRealtimeHandlers } from '@/modules/chat/hooks/useChatRealtimeHandlers';
+import { useNativeExecutionReconciliation } from '@/modules/chat/hooks/useNativeExecutionReconciliation';
 import { useChatComposerState } from '@/modules/chat/hooks/useChatComposerState';
 import { useSessionStore } from '@/modules/chat/hooks/useSessionStore';
 import {
@@ -325,9 +326,10 @@ function ChatInterface({
   // while Chat is hidden), then re-subscribe — the
   // `chat_subscribed` ack restores or clears the activity indicator, replays
   // missed live events, and re-attaches a still-running stream to this socket.
-  const handleWebSocketReconnect = useCallback(async () => {
-    if (!selectedProject || !selectedSession) return;
+  const handleWebSocketReconnect = useCallback(async (shouldContinue?: () => boolean) => {
+    if (!selectedProject || !selectedSession || shouldContinue?.() === false) return;
     await requestLatestMessages(selectedSession.id, isActive);
+    if (shouldContinue?.() === false) return;
     statusCheckSentAtRef.current.set(selectedSession.id, Date.now());
     sendMessage({
       type: 'chat.subscribe',
@@ -337,6 +339,12 @@ function ChatInterface({
       }],
     });
   }, [isActive, requestLatestMessages, selectedProject, selectedSession, sendMessage]);
+
+  useNativeExecutionReconciliation({
+    sessionId: selectedSession?.id ?? null,
+    enabled: isActive && isConnected && isDesktopExecuting && Boolean(selectedProject),
+    reconcile: handleWebSocketReconnect,
+  });
 
   useChatRealtimeHandlers({
     isActive,
@@ -601,7 +609,6 @@ function ChatInterface({
           isLoading={isProcessing}
           onAbortSession={handleAbortSession}
           canAbortSession={canAbortSession}
-          onCheckExecutionStatus={() => { void handleWebSocketReconnect(); }}
           permissionMode={permissionMode}
           availablePermissionModes={availablePermissionModes}
           onSelectPermissionMode={selectPermissionMode}
