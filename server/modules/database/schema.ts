@@ -265,6 +265,20 @@ CREATE TABLE IF NOT EXISTS superseded_provider_sessions (
 );
 `;
 
+/** Database initialization and upgrades retain native queue intent independently of a live browser. */
+export const CODEX_DESKTOP_SUBMISSIONS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS codex_desktop_submissions (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    app_session_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('queued', 'running', 'uncertain', 'completed', 'failed')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS codex_desktop_submissions_session_idx
+    ON codex_desktop_submissions(app_session_id, created_at DESC);
+`;
+
 export const INIT_SCHEMA_SQL = `
 -- Initialize authentication database
 PRAGMA foreign_keys = ON;
@@ -316,6 +330,8 @@ ON provider_models(provider, sort_order, id);
 ${USER_PREFERENCES_TABLE_SCHEMA_SQL}
 
 ${SESSION_DRAFTS_TABLE_SCHEMA_SQL}
+
+${CODEX_DESKTOP_SUBMISSIONS_TABLE_SCHEMA_SQL}
 
 ${SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL}
 `;

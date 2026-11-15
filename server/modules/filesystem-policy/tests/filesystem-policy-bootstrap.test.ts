@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
-import { initializeFilesystemPolicy } from '../index.js';
+import { getCodexDesktopQueueDelegationAllowed, initializeFilesystemPolicy } from '../index.js';
 
 function createFixture(temporaryRoot = os.tmpdir()) {
   const directory = fs.mkdtempSync(path.join(temporaryRoot, 'cloudcli.policy-bootstrap-'));
@@ -600,7 +600,7 @@ test('MDS cache discovery rejects empty, relative and filesystem-root paths', as
 });
 
 test('macOS /var cache alias normalizes without accepting additional cache symlinks', { skip: process.platform !== 'darwin' }, async (t) => {
-  const fixture = createFixture('/var/tmp');
+  const fixture = createFixture(os.tmpdir());
   t.after(() => fixture.cleanup());
   fixture.writeConfig();
   assert.ok(fixture.userCacheDirectory.startsWith('/private/var/'));
@@ -613,4 +613,50 @@ test('macOS /var cache alias normalizes without accepting additional cache symli
   assert.ok(capture);
   const profile = fs.readFileSync(capture, 'utf8');
   assert.ok(profile.includes(`(literal ${JSON.stringify(path.join(fixture.userCacheDirectory, 'mds', 'mds.lock'))})`));
+});
+
+
+test('Desktop queue delegation requires a validated explicit boolean opt-in and resets after failed startup', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  const options = {
+    environment: {}, homeDirectory: fixture.homeDirectory,
+    darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin' as const,
+    launch: () => undefined,
+  };
+  for (const allowed of [undefined, false, true]) {
+    fixture.writeConfig({ version: 1, writableRoots: [fixture.first], allowCodexDesktopQueueDelegation: allowed });
+    await initializeFilesystemPolicy(options);
+    assert.equal(getCodexDesktopQueueDelegationAllowed(), allowed === true);
+  }
+  for (const invalid of ['true', 1, null, {}, []]) {
+    fixture.writeConfig({ version: 1, writableRoots: [fixture.first], allowCodexDesktopQueueDelegation: invalid });
+    await assert.rejects(initializeFilesystemPolicy(options), /allowCodexDesktopQueueDelegation must be a boolean/);
+    assert.equal(getCodexDesktopQueueDelegationAllowed(), false);
+  }
+  fs.rmSync(fixture.configPath);
+  await initializeFilesystemPolicy({ ...options, environment: { CLOUDCLI_CODEX_DESKTOP_QUEUE_DELEGATION: '1' } });
+  assert.equal(getCodexDesktopQueueDelegationAllowed(), false, 'environment alone cannot enable Desktop delegation');
+});
+
+test('Desktop delegation opt-in is bound to sandbox profile attestation without weakening child restrictions', async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.cleanup());
+  const captures: Array<{ profilePath: string; environment: NodeJS.ProcessEnv }> = [];
+  const options = {
+    environment: {}, homeDirectory: fixture.homeDirectory,
+    darwinUserCacheDirectory: fixture.userCacheDirectory, platform: 'darwin' as const,
+    launch: (profilePath: string, environment: NodeJS.ProcessEnv) => { captures.push({ profilePath, environment }); },
+  };
+  fixture.writeConfig();
+  await initializeFilesystemPolicy(options);
+  fixture.writeConfig({ version: 1, writableRoots: [fixture.first, fixture.second], allowCodexDesktopQueueDelegation: true });
+  await initializeFilesystemPolicy(options);
+  assert.notEqual(captures[0].profilePath, captures[1].profilePath);
+  const profile = fs.readFileSync(captures[1].profilePath, 'utf8');
+  assert.ok(profile.includes('(deny job-creation)'));
+  assert.ok(profile.includes('(deny lsopen)'));
+  assert.ok(profile.includes('(deny appleevent-send)'));
+  await assert.rejects(initializeFilesystemPolicy({ ...options, environment: captures[0].environment }), /does not match/);
+  assert.equal(getCodexDesktopQueueDelegationAllowed(), false);
 });

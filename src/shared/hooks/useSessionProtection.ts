@@ -22,6 +22,10 @@ const sessionActivitiesMatch = (left: SessionActivity, right: SessionActivity): 
   left.statusText === right.statusText
   && left.canInterrupt === right.canInterrupt
   && left.startedAt === right.startedAt
+  && left.desktopExecution?.state === right.desktopExecution?.state
+  && left.desktopExecution?.requestId === right.desktopExecution?.requestId
+  && left.desktopExecution?.queueItemId === right.desktopExecution?.queueItemId
+  && left.desktopExecution?.turnId === right.desktopExecution?.turnId
   && Boolean(left.background) === Boolean(right.background)
   && backgroundTasksKey(left.tasks) === backgroundTasksKey(right.tasks);
 
@@ -74,11 +78,13 @@ export function useSessionProtection() {
       // its own clock: the stale idle-ack guard compares against it, and the
       // tasks' start is not when this response began.
       const continuing = existing && !existing.background ? existing : undefined;
+      const desktopExecution = activity?.desktopExecution ?? continuing?.desktopExecution;
       const next: SessionActivity = {
         statusText:
           activity?.statusText !== undefined ? activity.statusText : continuing?.statusText ?? null,
-        canInterrupt: activity?.canInterrupt ?? continuing?.canInterrupt ?? true,
+        canInterrupt: desktopExecution ? false : activity?.canInterrupt ?? continuing?.canInterrupt ?? true,
         startedAt: continuing?.startedAt ?? Date.now(),
+        ...(desktopExecution ? { desktopExecution } : {}),
         // The tasks keep running under the new turn; they are reported again
         // when it ends.
         ...(existing?.tasks ? { tasks: existing.tasks } : {}),
@@ -86,8 +92,7 @@ export function useSessionProtection() {
 
       if (
         continuing
-        && continuing.statusText === next.statusText
-        && continuing.canInterrupt === next.canInterrupt
+        && sessionActivitiesMatch(continuing, next)
       ) {
         return prev;
       }
@@ -188,19 +193,30 @@ export function useSessionProtection() {
           continue;
         }
 
+        const desktopExecution = snapshot.desktopExecution ?? existing?.desktopExecution;
         updated.set(sessionId, {
           statusText:
             snapshot.statusText !== undefined ? snapshot.statusText : existing?.statusText ?? null,
-          canInterrupt: snapshot.canInterrupt ?? existing?.canInterrupt ?? true,
+          canInterrupt: desktopExecution ? false : snapshot.canInterrupt ?? existing?.canInterrupt ?? true,
           startedAt: snapshotStartedAt ?? existing?.startedAt ?? now,
+          ...(desktopExecution ? { desktopExecution } : {}),
           ...(snapshot.background ? { background: true } : {}),
           ...(snapshot.tasks ? { tasks: snapshot.tasks } : {}),
         });
       }
 
       for (const [sessionId, activity] of prev) {
-        if (!incoming.has(sessionId) && now - activity.startedAt < LOCAL_ACTIVITY_GRACE_MS) {
-          updated.set(sessionId, activity);
+        if (!incoming.has(sessionId)) {
+          if (now - activity.startedAt < LOCAL_ACTIVITY_GRACE_MS) {
+            updated.set(sessionId, activity);
+          } else if (activity.desktopExecution && activity.desktopExecution.state !== 'completed' && activity.desktopExecution.state !== 'failed') {
+            // A missing process snapshot cannot cancel queued work in another
+            // owner. Keep it uncertain until subscribe/history confirms its end.
+            updated.set(sessionId, {
+              ...activity, statusText: null, canInterrupt: false,
+              desktopExecution: { ...activity.desktopExecution, state: 'uncertain' },
+            });
+          }
         }
       }
 

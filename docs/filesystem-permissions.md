@@ -88,6 +88,50 @@ and AppleEvents. Normal child commands still run inside the inherited policy.
 If provider authentication needs to open an external desktop browser, complete
 that sign-in from your normal terminal or browser instead.
 
+## Optional delegation to an already running Codex Desktop
+
+Native Desktop queue delegation is disabled by default. The server administrator
+can explicitly set `"allowCodexDesktopQueueDelegation": true` in this policy JSON
+and restart CloudCLI. The value must be a JSON boolean; a browser setting,
+request field, or environment flag cannot enable it. Changing this option changes
+the generated policy identity, so an already sandboxed server must restart with
+the new policy.
+
+With this opt-in, Chat can submit work to a verified Codex Desktop process that
+already owns the same native thread. Desktop remains the sole writer. This is
+an explicit exception to the rule against delegating work outside CloudCLI's
+process tree: **Desktop-owned execution does not inherit `writableRoots` or the
+CloudCLI Seatbelt sandbox.** Desktop uses its own filesystem permissions, model,
+authentication and approval configuration. Enable the option only when that
+Desktop execution boundary is intended. CloudCLI's ordinary child commands
+remain restricted; launchd, LaunchServices and AppleEvent delegation stay blocked.
+
+Owner verification requires an actually held native flock, one uniquely open
+process for that exact lock inode, the known Desktop parent bundle and embedded
+CLI, and a supported version. macOS does not report flock-holder PIDs through
+`lsof`; any additional open process, incomplete inventory, changed process/file
+identity or unsupported version leaves delegation unavailable. Verification is
+specific to the requested thread and does not release other thread writers.
+
+The initial integration supports the verified Desktop embedded CLI
+`0.169.0-alpha.11.1` and CloudCLI's pinned CLI/SDK `0.169.0`. Its queue RPC is
+experimental. An unsupported Desktop update or ambiguous owner is refused until
+compatibility is verified; CloudCLI never removes the native writer lock.
+
+For a supported owner, ordinary text sends automatically enter the existing
+native thread's queue. CloudCLI tracks the request through its native turn and
+reads completed output from that thread's history. Attachments and history edits
+are unavailable on this route. Web approvals and Stop are also unavailable; use
+the owning app for those actions. This does not connect the website to Desktop's
+live App Server or provide full remote Desktop control.
+
+Submission state survives a CloudCLI restart. A five-minute observation timeout
+marks delivery or completion as uncertain; it does not stop native execution or
+make resending safe. Use **Check status** to reconcile the same request. A lost
+acknowledgement, missing queue entry or changed owner never triggers an automatic
+resend. The generated request identifier prevents a completed Desktop submission
+from being executed again when the same request is replayed.
+
 ## Reinstalls and fork releases
 
 The policy lives outside the installed npm package. A release containing this

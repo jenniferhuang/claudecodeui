@@ -1,4 +1,14 @@
 {
+  "desktopExecution": {
+    "label": "Native session execution",
+    "lastVerified": "Native queue · Desktop last verified",
+    "queued": "Queued for the native session owner.",
+    "running": "Running through the native session owner.",
+    "uncertain": "Execution status is uncertain. The request may still run; do not resend.",
+    "permissions": "The native session owner uses its own permissions and settings. Web settings do not apply.",
+    "limits": "The owner may change after queuing. Handle approvals and stopping in the owning app. Completed output syncs here.",
+    "checkStatus": "Check status"
+  },
   "codeBlock": {
     "copy": "Copy",
     "copied": "Copied",

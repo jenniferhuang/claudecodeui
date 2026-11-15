@@ -123,12 +123,12 @@ const createFakeSubmitEvent = () => {
 };
 
 /**
- * A v4 UUID for a steered message. The id becomes the message's transcript
- * uuid, so it must be a real one. `crypto.randomUUID` only exists in secure
+ * A v4 UUID for a send request or steered message. Native Desktop admission
+ * and transcript correlation require a real UUID. `crypto.randomUUID` only exists in secure
  * contexts, and the app is often opened over plain http on a LAN address
  * (a phone on the same network), so this falls back to `getRandomValues`.
  */
-const createSteerMessageId = (): string => {
+const createClientMessageId = (): string => {
   if (typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
@@ -758,6 +758,7 @@ export function useChatComposerState({
     const toolsSettings = getToolsSettings();
 
     return {
+      requestId: createClientMessageId(),
       model: currentProviderModel,
       effort: currentProviderEffort,
       permissionMode: resolvePermissionModeForProvider(provider, permissionMode),
@@ -1017,7 +1018,7 @@ export function useChatComposerState({
   // agent reads it. Attachments must already be uploaded.
   const steerIntoRunningTurn = useCallback(
     (message: { content: string; attachments: File[]; uploadedAttachments: unknown[] }, steerSessionKey: string) => {
-      const messageId = createSteerMessageId();
+      const messageId = createClientMessageId();
       updatePendingSteers((current) => [...current, {
         messageId,
         sessionKey: steerSessionKey,
@@ -1144,6 +1145,9 @@ export function useChatComposerState({
       submitOptions?: SubmitOptions,
     ) => {
       event.preventDefault();
+      // Observer shutdown does not prove that another native owner stopped.
+      // Guard every entry point, including voice and a previously open dialog.
+      if (sessionKey && processingSessionsRef.current?.get(sessionKey)?.desktopExecution?.state === 'uncertain') return;
       const currentInput = queuedSubmission?.content ?? inputValueRef.current;
       const currentAttachments = queuedSubmission?.attachments ?? attachedFiles;
       const previouslyUploadedAttachments = queuedSubmission?.uploadedAttachments ?? [];
@@ -1405,16 +1409,21 @@ export function useChatComposerState({
       // One message shape for every provider. The backend resolves the
       // provider, project path, and provider-native resume id from the
       // session row; `options` only carries composer-level preferences.
+      const sendOptions = queuedSubmission?.options ?? buildSendOptions(messageContent);
+      const requestId = typeof sendOptions.requestId === 'string' && sendOptions.requestId
+        ? sendOptions.requestId
+        : createClientMessageId();
       sendMessage({
         // Replacing an already-sent message is its own frame: it changes the
         // shape of the conversation, so it gets validated separately and can
         // report why it was refused.
         type: editingAnchorId ? 'chat.edit-send' : 'chat.send',
         sessionId: targetSessionId,
+        requestId,
         ...(editingAnchorId ? { anchorId: editingAnchorId } : {}),
         content: messageContent,
         options: {
-          ...(queuedSubmission?.options ?? buildSendOptions(messageContent)),
+          ...sendOptions,
           attachments: uploadedAttachments,
         },
       });

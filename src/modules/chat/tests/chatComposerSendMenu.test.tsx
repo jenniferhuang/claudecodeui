@@ -101,6 +101,57 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+test('Desktop execution keeps a truthful banner and disables web controls until it settles', () => {
+  const onAbortSession = vi.fn();
+  const checkStatus = vi.fn();
+  const desktopActivity = (state: 'queued' | 'running' | 'uncertain'): SessionActivity => ({
+    statusText: 'Desktop execution', canInterrupt: false, startedAt: Date.now(),
+    desktopExecution: { state, requestId: 'r1', queueItemId: 'q1', turnId: null },
+  });
+  const composerProps = props({
+    isLoading: true, input: '', hasInput: false, onAbortSession, canAbortSession: false,
+    activity: desktopActivity('queued'), onCheckExecutionStatus: checkStatus,
+    availableModelOptions: [{ value: 'test-model', label: 'Test model' }],
+    availableEffortOptions: [{ value: 'high' }],
+  });
+  const view = render(<UiPreferencesProvider><ChatComposer {...composerProps} /></UiPreferencesProvider>);
+  assert.match(screen.getByRole('status', { name: 'Native session execution' }).textContent ?? '', /queued/i);
+  assert.match(screen.getByRole('status', { name: 'Native session execution' }).textContent ?? '', /last verified/i);
+  assert.match(screen.getByRole('status', { name: 'Native session execution' }).textContent ?? '', /owner may change/i);
+  assert.match(screen.getByRole('status', { name: 'Native session execution' }).textContent ?? '', /own permissions/i);
+  assert.equal((screen.getByRole('button', { name: 'Select model and reasoning effort' }) as HTMLButtonElement).disabled, true);
+  assert.equal((screen.getByRole('button', { name: /^Default Mode:/ }) as HTMLButtonElement).disabled, true);
+  assert.equal((screen.getByRole('button', { name: 'Stop' }) as HTMLButtonElement).disabled, true);
+
+  view.rerender(<UiPreferencesProvider><ChatComposer {...composerProps} activity={desktopActivity('running')} /></UiPreferencesProvider>);
+  assert.match(screen.getByRole('status', { name: 'Native session execution' }).textContent ?? '', /running/i);
+  view.rerender(<UiPreferencesProvider><ChatComposer {...composerProps} activity={desktopActivity('uncertain')} input="Do it again" hasInput /></UiPreferencesProvider>);
+  assert.match(screen.getByRole('status', { name: 'Native session execution' }).textContent ?? '', /not resend/i);
+  assert.equal(screen.queryByRole('button', { name: 'Send options' }), null);
+  fireEvent.click(screen.getByRole('button', { name: 'Check status' }));
+  assert.equal(checkStatus.mock.calls.length, 1);
+  assert.equal(onAbortSession.mock.calls.length, 0);
+
+  view.rerender(<UiPreferencesProvider><ChatComposer {...composerProps} activity={null} isLoading={false} /></UiPreferencesProvider>);
+  assert.equal(screen.queryByRole('status', { name: 'Native session execution' }), null);
+  assert.equal((screen.getByRole('button', { name: 'Select model and reasoning effort' }) as HTMLButtonElement).disabled, false);
+});
+
+test('uncertain Desktop execution blocks submit and keyboard sends without clearing the draft', () => {
+  const onSubmit = vi.fn();
+  const onTextareaKeyDown = vi.fn();
+  const { container } = render(<UiPreferencesProvider><ChatComposer {...props({
+    isLoading: true, input: 'Keep my draft', onSubmit, onTextareaKeyDown,
+    activity: { statusText: 'Desktop status uncertain', canInterrupt: false, startedAt: 1,
+      desktopExecution: { state: 'uncertain', requestId: 'r1', queueItemId: null, turnId: null } },
+  })} /></UiPreferencesProvider>);
+  fireEvent.submit(container.querySelector('form')!);
+  fireEvent.keyDown(screen.getByPlaceholderText('Message'), { key: 'Enter' });
+  assert.equal(onSubmit.mock.calls.length, 0);
+  assert.equal(onTextareaKeyDown.mock.calls.length, 0);
+  assert.equal((screen.getByPlaceholderText('Message') as HTMLTextAreaElement).value, 'Keep my draft');
+});
+
 test('idle: the plain send button, and no send menu', () => {
   render(<UiPreferencesProvider><ChatComposer {...props({})} /></UiPreferencesProvider>);
 

@@ -22,7 +22,7 @@ import {
  * own "fork" and "edit an earlier message" on top of.
  *
  * So this is a second transport to the same CLI, opened only for the
- * operations the SDK cannot express. Everything else still goes through the
+ * operations the SDK cannot express, including the native Desktop-owner queue. Everything else still goes through the
  * SDK.
  */
 
@@ -92,6 +92,7 @@ async function withAppServer<T>(
     onExit: (handler: (reason: string) => void) => () => void;
   }) => Promise<T>,
   signal?: AbortSignal,
+  experimentalApi = false,
 ): Promise<T> {
   // Resolved through the exported object, not a module-local function, so
   // tests can replace `codexAppServer.resolveLauncher` with a fake app-server
@@ -235,12 +236,10 @@ async function withAppServer<T>(
   signal?.addEventListener('abort', killOnAbort, { once: true });
 
   try {
-    // `capabilities` is deliberately empty. `thread/fork` with `lastTurnId` is
-    // in the stable protocol; only `beforeTurnId` and the turn-listing methods
-    // are gated behind `experimentalApi`, and neither is needed here.
+    // Ordinary fork operations stay stable; the native owner-queue RPC opts in explicitly.
     await call('initialize', {
       clientInfo: { name: 'cloudcli', title: 'CloudCLI', version: '1' },
-      capabilities: {},
+      capabilities: experimentalApi ? { experimentalApi: true } : {},
     });
     child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} })}\n`);
 
@@ -275,11 +274,53 @@ export const codexAppServer = {
     try {
       return require_.resolve('@openai/codex/bin/codex.js');
     } catch {
-      throw new AppError('The Codex CLI package is not installed, so Codex conversations cannot be branched.', {
+      throw new AppError('The Codex CLI package is not installed, so native Codex session operations are unavailable.', {
         code: 'CODEX_APP_SERVER_UNAVAILABLE',
         statusCode: 501,
       });
     }
+  },
+
+  /** Providers enqueue on the existing Desktop owner; this helper never resumes the target thread. */
+  async queueAdd(input: { threadId: string; clientMessageId: string; text: string }): Promise<{ id: string; clientMessageId: string }> {
+    return withAppServer(async ({ call }) => {
+      const result = await call('thread/queue/add', {
+        threadId: input.threadId,
+        clientUserMessageId: input.clientMessageId,
+        input: [{ type: 'text', text: input.text, textElements: [] }],
+      }) as { queuedSubmission?: { id?: unknown; clientUserMessageId?: unknown } };
+      const item = result?.queuedSubmission;
+      if (typeof item?.id !== 'string' || item.clientUserMessageId !== input.clientMessageId) {
+        throw new AppError('Native queue acknowledgement could not be correlated. Delivery is uncertain.', {
+          code: 'CODEX_QUEUE_UNCERTAIN', statusCode: 502,
+        });
+      }
+      return { id: item.id, clientMessageId: input.clientMessageId };
+    }, undefined, true);
+  },
+
+  /** Providers reconcile pending native input by client UUID; a missing row never proves completion. */
+  async queueList(threadId: string): Promise<Array<{ id: string; clientMessageId: string }>> {
+    return withAppServer(async ({ call }) => {
+      const items: Array<{ id: string; clientMessageId: string }> = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < 100; page++) {
+        const result = await call('thread/queue/list', { threadId, cursor, limit: 100 }) as {
+          data?: Array<{ id?: unknown; clientUserMessageId?: unknown }>; nextCursor?: unknown;
+        };
+        if (!Array.isArray(result?.data)) throw new Error('Native queue list response is invalid.');
+        for (const item of result.data) {
+          if (typeof item.id !== 'string' || typeof item.clientUserMessageId !== 'string') {
+            throw new Error('Native queue entry has no correlation identifiers.');
+          }
+          items.push({ id: item.id, clientMessageId: item.clientUserMessageId });
+        }
+        if (result.nextCursor == null) return items;
+        if (typeof result.nextCursor !== 'string' || result.nextCursor === cursor) throw new Error('Native queue cursor is invalid.');
+        cursor = result.nextCursor;
+      }
+      throw new Error('Native queue reconciliation exceeded its page limit.');
+    }, undefined, true);
   },
 
   /**

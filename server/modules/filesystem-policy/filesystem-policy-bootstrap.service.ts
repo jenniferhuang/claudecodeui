@@ -4,6 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+let codexDesktopQueueDelegationAllowed = false;
+
+/** Used by Chat routing to enforce the server-owned Desktop delegation opt-in. */
+export function getCodexDesktopQueueDelegationAllowed(): boolean {
+  return codexDesktopQueueDelegationAllowed;
+}
+
 type BootstrapOptions = {
   environment?: NodeJS.ProcessEnv;
   homeDirectory?: string;
@@ -74,6 +81,9 @@ function parseConfiguration(contents: string, homeDirectory: string) {
   }
   const record = config as Record<string, unknown>;
   if (record.version !== 1) throw new Error('Filesystem policy version must be 1');
+  if (record.allowCodexDesktopQueueDelegation !== undefined && typeof record.allowCodexDesktopQueueDelegation !== 'boolean') {
+    throw new Error('Filesystem policy allowCodexDesktopQueueDelegation must be a boolean');
+  }
   if (!Array.isArray(record.writableRoots) || record.writableRoots.length === 0) {
     throw new Error('Filesystem policy writableRoots must be a nonempty array');
   }
@@ -96,7 +106,7 @@ function parseConfiguration(contents: string, homeDirectory: string) {
     && !writableRoots.some((root) => containsPath(root, runtimeDirectory))) {
     throw new Error('Filesystem policy runtimeDirectory must be under .cloudcli or a writable root');
   }
-  return { writableRoots, runtimeDirectory };
+  return { writableRoots, runtimeDirectory, allowCodexDesktopQueueDelegation: record.allowCodexDesktopQueueDelegation === true };
 }
 
 function discoverDarwinUserCacheDirectory(): string {
@@ -225,6 +235,7 @@ function renderProfile(
   runtimeDirectory: string,
   operational: ReturnType<typeof operationalWritePaths>,
   protectedFiles: string[],
+  allowCodexDesktopQueueDelegation: boolean,
 ): string {
   const terms = [
     ...new Set([...writableRoots, runtimeDirectory, ...operational.directories]),
@@ -233,11 +244,14 @@ function renderProfile(
   terms.push('(literal "/dev/null")', '(literal "/dev/tty")', '(literal "/dev/ptmx")', '(regex #"^/dev/ttys[0-9]+$")');
   terms.push(...operational.patterns.map((pattern) => `(regex ${seatbeltRegex(pattern)})`));
   return [
-    '; Generated CloudCLI filesystem policy: project data is writable only under writableRoots.',
+    '; Generated CloudCLI filesystem policy: CloudCLI-owned project writes are limited to writableRoots.',
     '; Operational exceptions permit databases, transcripts, auth refresh, caches and terminal devices.',
     '(version 1)', '(allow default)',
-    '; Ordinary child execution inherits this boundary. Do not delegate work to',
-    '; launchd or external applications that may execute outside this process tree.',
+    '; Ordinary child execution inherits this boundary.',
+    allowCodexDesktopQueueDelegation
+      ? '; Explicit opt-in permits only verified native Desktop queue delegation outside writableRoots and this Seatbelt boundary.'
+      : '; Do not delegate to external applications; native Desktop queue delegation is disabled.',
+    '; Other external delegation and launchd execution outside this process tree remain forbidden.',
     '(deny job-creation)', '(deny lsopen)', '(deny appleevent-send)',
     `(deny file-write* (require-not (require-any\n  ${terms.join('\n  ')}\n)))`,
     `(deny file-write* ${protectedFiles.map((entry) => `(literal ${JSON.stringify(entry)})`).join(' ')})`,
@@ -279,6 +293,7 @@ async function launchSandboxedProcess(profilePath: string, environment: NodeJS.P
  * governed by macOS ownership/privacy permissions.
  */
 export async function initializeFilesystemPolicy(options: BootstrapOptions = {}): Promise<void> {
+  codexDesktopQueueDelegationAllowed = false;
   const environment = options.environment ?? process.env;
   const homeDirectory = canonicalPath(options.homeDirectory ?? os.homedir());
   const configuredPath = environment.CLOUDCLI_FILESYSTEM_POLICY;
@@ -300,7 +315,7 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
     if (configuredPath === undefined && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw new Error(`Unable to load CloudCLI filesystem policy: ${(error as Error).message}`);
   }
-  const { writableRoots, runtimeDirectory } = parseConfiguration(contents, homeDirectory);
+  const { writableRoots, runtimeDirectory, allowCodexDesktopQueueDelegation } = parseConfiguration(contents, homeDirectory);
   if ((options.platform ?? process.platform) !== 'darwin') {
     throw new Error('Configured CloudCLI filesystem policy requires macOS sandbox-exec; refusing an unprotected start');
   }
@@ -312,7 +327,7 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
   // Hash the actual policy semantics, excluding only its own not-yet-known
   // filename. Distinct runtime/DB grants must not overwrite another service's
   // profile or break that service's inherited-bootstrap attestation.
-  const baseProfile = renderProfile(writableRoots, runtimeDirectory, operational, protectedConfigPaths);
+  const baseProfile = renderProfile(writableRoots, runtimeDirectory, operational, protectedConfigPaths, allowCodexDesktopQueueDelegation);
   const digest = createHash('sha256').update(baseProfile).digest('hex').slice(0, 16);
   const profilePath = path.join(path.dirname(configPath), `filesystem-policy-${digest}.sb`);
   const protectedPaths = [...protectedConfigPaths, profilePath];
@@ -323,7 +338,7 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
       throw new Error('Filesystem policy and generated profile must be outside writable project and runtime locations');
     }
   }
-  const profile = renderProfile(writableRoots, runtimeDirectory, operational, protectedPaths);
+  const profile = renderProfile(writableRoots, runtimeDirectory, operational, protectedPaths, allowCodexDesktopQueueDelegation);
   const childEnvironment = {
     ...environment,
     // Keep a safe read-only alias stable across re-exec so both processes
@@ -354,6 +369,7 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
       throw new Error('CloudCLI sandbox marker is set but an inherited macOS sandbox could not be verified');
     }
     Object.assign(environment, childEnvironment);
+    codexDesktopQueueDelegationAllowed = allowCodexDesktopQueueDelegation;
     return;
   }
   fs.mkdirSync(childEnvironment.TMPDIR, { recursive: true, mode: 0o700 });
@@ -371,4 +387,5 @@ export async function initializeFilesystemPolicy(options: BootstrapOptions = {})
     fs.rmSync(pendingPath, { force: true });
   }
   await (options.launch ?? launchSandboxedProcess)(profilePath, childEnvironment);
+  codexDesktopQueueDelegationAllowed = allowCodexDesktopQueueDelegation;
 }
