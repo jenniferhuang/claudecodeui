@@ -40,7 +40,6 @@ import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageLi
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
 import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
 import ComposerSendMenu from '@/modules/chat/composer/ComposerSendMenu';
-import DesktopExecutionBanner from '@/modules/chat/composer/DesktopExecutionBanner';
 
 type MentionableFile = {
   name: string;
@@ -63,8 +62,6 @@ type ChatComposerProps = {
   onAbortSession: () => void;
   /** Whether the viewed session can currently be interrupted; threaded to the send menu's Stop row, which otherwise looks actionable while `onAbortSession` already no-ops. Defaults to true so existing callers and tests, which never had a non-interruptible turn, keep working. */
   canAbortSession?: boolean;
-  /** Re-subscribes and refreshes the current session without submitting another request. */
-  onCheckExecutionStatus?: () => void;
   permissionMode: PermissionMode;
   availablePermissionModes: PermissionMode[];
   onSelectPermissionMode: (mode: PermissionMode) => void;
@@ -153,7 +150,6 @@ export default function ChatComposer({
   isLoading,
   onAbortSession,
   canAbortSession = true,
-  onCheckExecutionStatus,
   permissionMode,
   availablePermissionModes,
   onSelectPermissionMode,
@@ -311,10 +307,6 @@ export default function ChatComposer({
         <div className="pointer-events-none absolute bottom-full left-1/2 z-10 w-[calc(100%-1rem)] max-w-[54.25rem] -translate-x-1/2 translate-y-px bg-transparent sm:w-[calc(100%-2rem)]">
           <ActivityIndicator activity={activity} onAbort={onAbortSession} isInputFocused={isInputFocused} />
         </div>
-      )}
-
-      {isDesktopExecuting && desktopExecution && (
-        <DesktopExecutionBanner execution={desktopExecution} onCheckStatus={onCheckExecutionStatus} />
       )}
 
       {hasPendingPermissions && (
