@@ -113,6 +113,13 @@ CLI, and a supported version. macOS does not report flock-holder PIDs through
 identity or unsupported version leaves delegation unavailable. Verification is
 specific to the requested thread and does not release other thread writers.
 
+Desktop process snapshots use the existing system Perl runtime and bounded
+read-only Darwin process queries. They retain PID, parent, start time, executable
+and argument validation without launching macOS's setuid `ps`, which cannot run
+inside the managed sandbox. The helper discards environment data and fails closed
+when the native query is unavailable or its output is incomplete. The filesystem
+policy is unchanged.
+
 The initial integration supports the verified Desktop embedded CLI
 `0.169.0-alpha.11.1` and CloudCLI's pinned CLI/SDK `0.169.0`. Its queue RPC is
 experimental. An unsupported Desktop update or ambiguous owner is refused until

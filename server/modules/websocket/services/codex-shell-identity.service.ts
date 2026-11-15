@@ -6,6 +6,54 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const SAFE_NATIVE_ID = /^[a-zA-Z0-9_.\-:]+$/;
 
+// Darwin's setuid /bin/ps cannot execute inside Seatbelt. This fixed system-Perl
+// probe reads BSD identity, the kernel executable path and exactly argc arguments through native kernel
+// calls; environment bytes from KERN_PROCARGS2 are never decoded or returned.
+const DARWIN_PROCESS_IDENTITY_PROBE = String.raw`
+  use strict; use warnings; use JSON::PP;
+  my ($pid) = ($ARGV[0] // '') =~ /\A([1-9][0-9]*)\z/;
+  die "invalid pid\n" unless defined($pid) && $pid <= 2147483647;
+  die "unsupported native word size\n" unless length(pack('J',0)) == 8 && length(pack('L',0)) == 4;
+  my $bsd = "\0" x 136;
+  my $n = syscall(336,2,0+$pid,3,0,$bsd,136);
+  die "proc_info failed\n" unless $n == 136;
+  my @b = unpack('L12a16a32L6Q2',$bsd);
+  die "invalid identity\n" unless $b[3] == $pid && $b[4] > 0 && $b[4] != $pid && $b[20] > 0 && $b[21] < 1000000;
+  my $pathbuf = "\0" x 4096;
+  $n = syscall(336,2,0+$pid,11,0,$pathbuf,4096);
+  my $pathend = index($pathbuf,"\0");
+  die "kernel executable failed\n" unless $n == 0 && $pathend > 0 && $pathend < 4096;
+  my $executable = substr($pathbuf,0,$pathend);
+  die "invalid kernel executable\n" unless substr($executable,0,1) eq '/';
+  my $mib = pack('i3',1,49,0+$pid);
+  my $length = pack('J',0);
+  $n = syscall(202,$mib,3,0,$length,0,0);
+  my $capacity = unpack('J',$length);
+  die "args size failed\n" unless $n == 0 && $capacity >= 6 && $capacity <= 2097152;
+  my $buf = "\0" x $capacity;
+  $n = syscall(202,$mib,3,$buf,$length,0,0);
+  my $actual = unpack('J',$length);
+  die "args read failed\n" unless $n == 0 && $actual >= 6 && $actual <= $capacity;
+  $buf = substr($buf,0,$actual);
+  my $argc = unpack('i',substr($buf,0,4));
+  die "invalid argc\n" unless $argc >= 1 && $argc <= 256;
+  my $end = index($buf,"\0",4);
+  die "invalid executable\n" unless $end > 4 && $end < $actual;
+  my $saved_executable = substr($buf,4,$end-4);
+  die "executable identity changed\n" unless $saved_executable eq $executable;
+  my $off = $end + 1;
+  $off++ while $off < $actual && substr($buf,$off,1) eq "\0";
+  my @argv;
+  for (1..$argc) {
+    my $tail = index($buf,"\0",$off);
+    die "truncated argv\n" if $tail < $off || $tail >= $actual;
+    push @argv, substr($buf,$off,$tail-$off);
+    $off = $tail + 1;
+  }
+  die "empty argv0\n" unless length($argv[0]);
+  print JSON::PP->new->ascii->encode({pid=>0+$pid,parentPid=>$b[4],startSeconds=>$b[20],startMicroseconds=>$b[21],executable=>$executable,argv=>\@argv}),"\n";
+`;
+
 type IdentityDependencies = {
   platform?: NodeJS.Platform;
   runFile?: (executable: string, args: string[], options: { timeout: number; maxBuffer: number; env?: NodeJS.ProcessEnv }) => Promise<{ stdout: string; stderr?: string }>;
@@ -143,7 +191,12 @@ export async function inspectCodexDesktopOwner(
   const execute = dependencies.runFile ?? execFileAsync;
   // Locale warnings would make a complete OS inventory look incomplete. Pin
   // only these bounded probes; leave the server/provider environment unchanged.
-  const inspectionEnvironment = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+  const inspectionEnvironment: NodeJS.ProcessEnv = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+  // Taint mode also ignores Perl injection variables; clear them explicitly so
+  // these fixed native probes never load a caller-supplied startup module.
+  for (const key of Object.keys(inspectionEnvironment)) {
+    if (key.startsWith('PERL')) delete inspectionEnvironment[key];
+  }
   const runFile: NonNullable<IdentityDependencies['runFile']> = async (executable, args, settings) => {
     const result = await execute(executable, args, { ...settings, env: inspectionEnvironment });
     // lsof may return a partial inventory with a successful status. Never
@@ -218,25 +271,34 @@ export async function inspectCodexDesktopOwner(
         && entries.some((entry) => entry.fd === 'txt' && matchesFile(entry, expectedPath, expectedIdentity));
     };
     const processIdentity = async (pid: number, expectedExecutable: string, expectedFile: { dev: number; ino: number }) => {
-      const identity = await runFile('/bin/ps', ['-o', 'ppid=,lstart=', '-p', String(pid)], options);
-      const parsed = identity.stdout.trim().match(/^(\d+)\s+(.+)$/);
-      if (!parsed || Number(parsed[1]) <= 0 || Number(parsed[1]) === pid) return null;
-      const command = await runFile('/bin/ps', ['-o', 'comm=', '-p', String(pid)], options);
-      if (command.stdout.trim() !== expectedExecutable || !await mappedExecutable(pid, expectedExecutable, expectedFile)) return null;
-      return { parentPid: Number(parsed[1]), identity: identity.stdout.trim() };
+      const { stdout } = await runFile('/usr/bin/perl', ['-T', '-e', DARWIN_PROCESS_IDENTITY_PROBE, String(pid)], options);
+      const parsed: unknown = JSON.parse(stdout);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      const record = parsed as Record<string, unknown>;
+      if (Object.keys(record).sort().join(',') !== 'argv,executable,parentPid,pid,startMicroseconds,startSeconds'
+        || record.pid !== pid || !Number.isSafeInteger(record.parentPid) || Number(record.parentPid) <= 0
+        || Number(record.parentPid) > 2147483647 || record.parentPid === pid
+        || !Number.isSafeInteger(record.startSeconds) || Number(record.startSeconds) <= 0
+        || !Number.isSafeInteger(record.startMicroseconds) || Number(record.startMicroseconds) < 0
+        || Number(record.startMicroseconds) >= 1000000 || record.executable !== expectedExecutable
+        || !Array.isArray(record.argv) || record.argv.length < 1 || record.argv.length > 256
+        || record.argv[0] !== expectedExecutable
+        || record.argv.some(value => typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > 2097152)
+        || !await mappedExecutable(pid, expectedExecutable, expectedFile)) return null;
+      return {
+        pid, parentPid: Number(record.parentPid), startSeconds: Number(record.startSeconds),
+        startMicroseconds: Number(record.startMicroseconds), executable: expectedExecutable, argv: record.argv as string[],
+      };
     };
     const snapshot = async () => {
       const child = await processIdentity(ownerPid, executable, executableBefore);
       if (!child) return null;
       const parent = await processIdentity(child.parentPid, parentExecutable, parentExecutableBefore);
       if (!parent) return null;
-      const { stdout } = await runFile('/bin/ps', ['-o', 'args=', '-p', String(ownerPid)], options);
-      const command = stdout.trim();
       // This verified Desktop build adds these exact boolean startup overrides.
-      // Do not accept general -c options: model/provider or transport overrides
-      // would invalidate the capability check for this stdio app-server owner.
-      if (!command.startsWith(`${executable} `)) return null;
-      const tokens = command.slice(executable.length + 1).split(/\s+/);
+      // Native argv boundaries are retained: never split a rendered command or
+      // accept general -c model/provider/transport options for this known owner.
+      const tokens = child.argv.slice(1);
       const permittedOverrides = new Set([
         'features.code_mode_host=true',
         'plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
@@ -257,7 +319,7 @@ export async function inspectCodexDesktopOwner(
         } else return null;
       }
       if (!appServer) return null;
-      return { child, parent, command };
+      return { child, parent };
     };
     const before = await snapshot();
     if (!before) return null;

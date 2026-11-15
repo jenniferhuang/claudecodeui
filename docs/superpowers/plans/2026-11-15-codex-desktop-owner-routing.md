@@ -60,8 +60,41 @@ deployment, enabling the server policy opt-in, and a bounded no-tools acceptance
 message. Preserve Desktop and unrelated native sessions; recheck no active
 CloudCLI runs or retained Shells immediately before service cutover.
 
-- [ ] PR Linux/macOS quality checks, merge, and immutable fork tarball release.
-- [ ] Verify release provenance, install into a new remote prefix, back up policy,
+- [x] PR Linux/macOS quality checks, merge, and immutable jh.4 fork tarball release.
+- [x] Verify release provenance, install jh.4 into a new remote prefix, back up policy,
   LaunchAgent and database, enable the opt-in, and restart CloudCLI when idle.
 - [ ] Test the originally Desktop-owned thread through the deployed gateway;
   verify correlated completion, replay deduplication and preserved native ownership.
+
+## Sandboxed deployment follow-up
+
+The jh.4 release passed both platform quality/install checks and deployed with
+Desktop PID 18520 and the original held lock preserved. Live admission refused
+the diagnostic before enqueue: request c7750092-6b57-4893-815c-5a9ed7626137
+has no durable ledger entry and the native transcript hash stayed unchanged.
+
+The exact installed owner inspector succeeds in ordinary SSH but fails under
+the deployed filesystem policy at `/bin/ps` with spawn EPERM. macOS ships that
+executable setuid; the existing Seatbelt boundary refuses it. Do not weaken the
+profile or remove writer checks. Replace Desktop process snapshots with bounded
+read-only native inspection through the existing system Perl runtime, retaining
+PID/start/parent/executable/argv validation and repeated inode/flock checks.
+
+- [x] Prove the native snapshot under the unchanged remote sandbox before release.
+- [x] Add the sandbox regression and fail-closed identity/parser coverage.
+- [ ] Run focused/full required checks, review, merge and release jh.5.
+- [ ] Verify installed package provenance, deploy idle CloudCLI only, and repeat
+  one correlated live acceptance plus same-request deduplication check.
+
+The final full owner inspector passed twice under the exact unchanged remote
+profile with Desktop still holding the target flock. A separate read-only native
+`thread/queue/list` call also passed inside that profile, with no queued input.
+The fixed Perl helper crosschecks the kernel executable path against saved
+process-argument metadata; it returns precise start time and only argc arguments.
+
+Local jh.5 verification: 26 focused tests passed, full backend 1,194 passed and
+4 skipped, 9 release safeguards passed, typecheck/lint/production build passed,
+and final independent code review found no material issue. The first full run's
+unchanged filesystem-policy fixture inherited the App's custom CODEX_HOME and
+failed its default-home assertion. With that selector unset to match CI, the
+isolated 30-test policy suite and unchanged complete backend rerun passed.
