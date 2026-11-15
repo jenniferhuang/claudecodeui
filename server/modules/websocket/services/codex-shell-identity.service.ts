@@ -8,7 +8,9 @@ const SAFE_NATIVE_ID = /^[a-zA-Z0-9_.\-:]+$/;
 
 type IdentityDependencies = {
   platform?: NodeJS.Platform;
-  runFile?: (executable: string, args: string[], options: { timeout: number; maxBuffer: number }) => Promise<{ stdout: string }>;
+  runFile?: (executable: string, args: string[], options: { timeout: number; maxBuffer: number; env?: NodeJS.ProcessEnv }) => Promise<{ stdout: string; stderr?: string }>;
+  /** Isolates the fixed Desktop bundle in filesystem fixtures; never request-controlled. */
+  desktopApplicationPath?: string;
 };
 
 /**
@@ -118,5 +120,165 @@ export async function hasHeldCodexThreadLock(
     return stdout.trim() === 'clear' ? false : undefined;
   } catch {
     return undefined;
+  }
+}
+
+
+/**
+ * Used by Chat admission before server-authorized native queue delegation.
+ * Darwin does not expose flock owners through lsof: a held kernel flock plus
+ * exactly one open process for the same inode is the conservative attribution.
+ * Two unchanged inventories, process/parent identities, executable mappings and
+ * file identities are required. Extra open processes or incomplete inspection
+ * fail closed. The caller must re-inspect before acting on a retained result.
+ */
+export async function inspectCodexDesktopOwner(
+  nativeId: string,
+  codexHome: string,
+  dependencies: IdentityDependencies = {},
+): Promise<{ pid: number; identity: string; version: string } | null> {
+  if ((dependencies.platform ?? process.platform) !== 'darwin'
+    || !SAFE_NATIVE_ID.test(nativeId) || nativeId === '.' || nativeId === '..') return null;
+  const options = { timeout: 1000, maxBuffer: 1024 * 1024 };
+  const execute = dependencies.runFile ?? execFileAsync;
+  // Locale warnings would make a complete OS inventory look incomplete. Pin
+  // only these bounded probes; leave the server/provider environment unchanged.
+  const inspectionEnvironment = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+  const runFile: NonNullable<IdentityDependencies['runFile']> = async (executable, args, settings) => {
+    const result = await execute(executable, args, { ...settings, env: inspectionEnvironment });
+    // lsof may return a partial inventory with a successful status. Never
+    // infer a unique lock owner from a command that reported an error/warning.
+    if (result.stderr?.trim()) throw new Error('Incomplete Desktop owner inspection');
+    return result;
+  };
+  const applicationPath = dependencies.desktopApplicationPath ?? '/Applications/ChatGPT.app';
+  const executable = path.join(applicationPath, 'Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex');
+  const parentExecutable = path.join(applicationPath, 'Contents/MacOS/ChatGPT');
+  const plist = path.join(applicationPath, 'Contents/Info.plist');
+  try {
+    const directory = await fs.realpath(path.join(codexHome, 'thread-writer-locks'));
+    const requestedLock = path.join(directory, `${nativeId}.lock`);
+    const lockPath = await fs.realpath(requestedLock);
+    if (lockPath !== requestedLock) return null;
+    const fileIdentity = async (file: string) => {
+      if (await fs.realpath(file) !== file) throw new Error('Unexpected Desktop path alias');
+      const info = await fs.stat(file);
+      if (!info.isFile()) throw new Error('Expected a regular Desktop identity file');
+      return { dev: info.dev, ino: info.ino, size: info.size, mtime: info.mtimeMs, ctime: info.ctimeMs };
+    };
+    const lockBefore = await fileIdentity(lockPath);
+    const held = () => hasHeldCodexThreadLock(nativeId, codexHome, { ...dependencies, runFile });
+    if (await held() !== true) return null;
+    const records = (stdout: string) => {
+      const result: Array<{ pid: number; fd: string; type: string; dev: string; ino: string; name: string }> = [];
+      let currentPid = 0;
+      let entry: (typeof result)[number] | undefined;
+      for (const line of stdout.split('\n')) {
+        if (line.startsWith('p')) {
+          if (entry) result.push(entry);
+          entry = undefined;
+          currentPid = /^p[0-9]+$/.test(line) ? Number(line.slice(1)) : 0;
+        } else if (line.startsWith('f')) {
+          if (entry) result.push(entry);
+          entry = { pid: currentPid, fd: line.slice(1), type: '', dev: '', ino: '', name: '' };
+        } else if (entry) {
+          if (line.startsWith('t')) entry.type = line.slice(1);
+          if (line.startsWith('D')) entry.dev = line.slice(1);
+          if (line.startsWith('i')) entry.ino = line.slice(1);
+          if (line.startsWith('n')) entry.name = line.slice(1);
+        }
+      }
+      if (entry) result.push(entry);
+      return result;
+    };
+    const matchesFile = (entry: ReturnType<typeof records>[number], file: string, identity: { dev: number; ino: number }) => {
+      if (entry.type !== 'REG' || entry.name !== file || !/^0x[0-9a-f]+$/i.test(entry.dev)
+        || !/^[0-9]+$/.test(entry.ino)) return false;
+      return BigInt(entry.dev) === BigInt(identity.dev) && BigInt(entry.ino) === BigInt(identity.ino);
+    };
+    const inventory = async () => {
+      const { stdout } = await runFile('/usr/sbin/lsof', ['-nP', '-F', 'pftDin', lockPath], options);
+      const entries = records(stdout);
+      if (!entries.length || entries.some((entry) => !Number.isSafeInteger(entry.pid) || entry.pid <= 0
+        || !/^[0-9]+$/.test(entry.fd) || !matchesFile(entry, lockPath, lockBefore))) return null;
+      const pids = new Set(entries.map((entry) => entry.pid));
+      if (pids.size !== 1 || pids.has(process.pid)) return null;
+      return { pid: entries[0].pid, key: JSON.stringify(entries.sort((a, b) => a.fd.localeCompare(b.fd))) };
+    };
+    const firstInventory = await inventory();
+    if (!firstInventory) return null;
+    const ownerPid = firstInventory.pid;
+    const executableBefore = await fileIdentity(executable);
+    const parentExecutableBefore = await fileIdentity(parentExecutable);
+    const plistBefore = await fileIdentity(plist);
+    const mappedExecutable = async (pid: number, expectedPath: string, expectedIdentity: { dev: number; ino: number }) => {
+      const { stdout } = await runFile('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), '-d', 'txt', '-F', 'pftDin'], options);
+      const entries = records(stdout);
+      return entries.length > 0 && entries.every((entry) => entry.pid === pid)
+        && entries.some((entry) => entry.fd === 'txt' && matchesFile(entry, expectedPath, expectedIdentity));
+    };
+    const processIdentity = async (pid: number, expectedExecutable: string, expectedFile: { dev: number; ino: number }) => {
+      const identity = await runFile('/bin/ps', ['-o', 'ppid=,lstart=', '-p', String(pid)], options);
+      const parsed = identity.stdout.trim().match(/^(\d+)\s+(.+)$/);
+      if (!parsed || Number(parsed[1]) <= 0 || Number(parsed[1]) === pid) return null;
+      const command = await runFile('/bin/ps', ['-o', 'comm=', '-p', String(pid)], options);
+      if (command.stdout.trim() !== expectedExecutable || !await mappedExecutable(pid, expectedExecutable, expectedFile)) return null;
+      return { parentPid: Number(parsed[1]), identity: identity.stdout.trim() };
+    };
+    const snapshot = async () => {
+      const child = await processIdentity(ownerPid, executable, executableBefore);
+      if (!child) return null;
+      const parent = await processIdentity(child.parentPid, parentExecutable, parentExecutableBefore);
+      if (!parent) return null;
+      const { stdout } = await runFile('/bin/ps', ['-o', 'args=', '-p', String(ownerPid)], options);
+      const command = stdout.trim();
+      // This verified Desktop build adds these exact boolean startup overrides.
+      // Do not accept general -c options: model/provider or transport overrides
+      // would invalidate the capability check for this stdio app-server owner.
+      if (!command.startsWith(`${executable} `)) return null;
+      const tokens = command.slice(executable.length + 1).split(/\s+/);
+      const permittedOverrides = new Set([
+        'features.code_mode_host=true',
+        'plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+      ]);
+      const seenOverrides = new Set<string>();
+      let appServer = false;
+      let analytics = false;
+      for (let index = 0; index < tokens.length; index += 1) {
+        const token = tokens[index];
+        if (token === '-c') {
+          const override = tokens[++index];
+          if (!permittedOverrides.has(override) || seenOverrides.has(override)) return null;
+          seenOverrides.add(override);
+        } else if (token === 'app-server' && !appServer) {
+          appServer = true;
+        } else if (token === '--analytics-default-enabled' && appServer && !analytics) {
+          analytics = true;
+        } else return null;
+      }
+      if (!appServer) return null;
+      return { child, parent, command };
+    };
+    const before = await snapshot();
+    if (!before) return null;
+    const bundle = await runFile('/usr/bin/plutil', ['-extract', 'CFBundleIdentifier', 'raw', '-o', '-', plist], options);
+    if (bundle.stdout.trim() !== 'com.openai.codex') return null;
+    // The probe target comes from our fixed allowlist, never captured argv or
+    // an lsof-reported arbitrary executable. Its mapped inode is checked above.
+    const reported = await runFile(executable, ['--version'], options);
+    const version = reported.stdout.trim().match(/^codex-cli (0\.169\.0-alpha\.11\.1)$/)?.[1];
+    if (!version) return null;
+    const after = await snapshot();
+    const finalInventory = await inventory();
+    if (!after || JSON.stringify(after) !== JSON.stringify(before)
+      || !finalInventory || finalInventory.key !== firstInventory.key
+      || JSON.stringify(await fileIdentity(lockPath)) !== JSON.stringify(lockBefore)
+      || JSON.stringify(await fileIdentity(executable)) !== JSON.stringify(executableBefore)
+      || JSON.stringify(await fileIdentity(parentExecutable)) !== JSON.stringify(parentExecutableBefore)
+      || JSON.stringify(await fileIdentity(plist)) !== JSON.stringify(plistBefore)
+      || await held() !== true) return null;
+    return { pid: ownerPid, version, identity: JSON.stringify({ pid: ownerPid, ...before, lock: lockBefore, executable: executableBefore, parentExecutable: parentExecutableBefore, plist: plistBefore }) };
+  } catch {
+    return null;
   }
 }

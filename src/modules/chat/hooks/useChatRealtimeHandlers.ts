@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
-import type { ServerEvent,MarkSessionIdle,MarkSessionProcessing,PendingPermissionRequest,ProjectSession,LLMProvider,NormalizedMessage,GetSessionActivity,MarkSessionBackground,SideQuestionEvent,SteerOutcome } from '@/shared/types';
+import type { DesktopExecution,ServerEvent,MarkSessionIdle,MarkSessionProcessing,PendingPermissionRequest,ProjectSession,LLMProvider,NormalizedMessage,GetSessionActivity,MarkSessionBackground,SideQuestionEvent,SteerOutcome } from '@/shared/types';
 import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
 import { playChatCompletionSound, playNotificationSound } from '@/shared/utils';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
@@ -101,6 +101,9 @@ export function useChatRealtimeHandlers({
   // listener so back-to-back permission events can dedupe and re-arm the
   // notification sound before React finishes a rerender.
   const pendingPermissionRequestsRef = useRef(pendingPermissionRequests);
+  // Native status and observer completion can arrive before React commits
+  // the activity map. Keep their per-session lifecycle ordering synchronous.
+  const desktopExecutionsRef = useRef(new Map<string, DesktopExecution>());
 
   useEffect(() => {
     pendingPermissionRequestsRef.current = pendingPermissionRequests;
@@ -119,9 +122,13 @@ export function useChatRealtimeHandlers({
       if (!msg.kind) {
         return;
       }
+      // External execution must never inherit the viewed session's identity
+      // from a late or malformed frame during a session switch.
+      if (msg.desktopExecution && !msg.sessionId) return;
 
       const activeViewSessionId = activeViewSessionIdRef.current;
       const sid = (typeof msg.sessionId === 'string' && msg.sessionId) || activeViewSessionId;
+      if (sid && msg.desktopExecution) desktopExecutionsRef.current.set(sid, msg.desktopExecution);
 
       // Record replay progress for every sequenced live event.
       if (sid && typeof msg.seq === 'number') {
@@ -151,9 +158,14 @@ export function useChatRealtimeHandlers({
           // pending tool-permission prompts for the run.
           if (!sid) return;
 
-          if (msg.isProcessing) {
-            onSessionProcessing?.(sid);
+          if (msg.isProcessing || (msg.desktopExecution && msg.desktopExecution.state !== 'completed' && msg.desktopExecution.state !== 'failed')) {
+            onSessionProcessing?.(sid, msg.desktopExecution ? {
+              statusText: msg.text,
+              canInterrupt: false,
+              desktopExecution: msg.desktopExecution,
+            } : undefined);
           } else {
+            desktopExecutionsRef.current.delete(sid);
             // Idle ack: ignore it if a newer request started after the
             // subscribe was sent — the ack describes the older state.
             onSessionIdle?.(sid, {
@@ -187,6 +199,19 @@ export function useChatRealtimeHandlers({
         }
 
         case 'protocol_error': {
+          // A fresh tab may learn an outstanding native request from its send
+          // refusal before subscribe/poll restores that session's activity.
+          if (sid && msg.desktopExecution && msg.desktopExecution.state !== 'completed' && msg.desktopExecution.state !== 'failed') {
+            onSessionProcessing?.(sid, {
+              statusText: typeof msg.error === 'string' ? msg.error : msg.text,
+              canInterrupt: false,
+              desktopExecution: msg.desktopExecution,
+            });
+          } else if (sid && msg.code === 'DESKTOP_STOP_UNAVAILABLE' && msg.canInterrupt === false) {
+            // Native admission can reserve the executor before a durable
+            // queue record exists. A refused Stop does not end that request.
+            onSessionProcessing?.(sid, { canInterrupt: false });
+          }
           // A message sent into a turn that had already ended. The run is not
           // failing — it finished — so nothing is shown or idled here; the
           // composer sends the message as the next turn instead.
@@ -232,7 +257,9 @@ export function useChatRealtimeHandlers({
             // the run never started (or was rejected), so no `complete` follows.
             // A refused or failed stop request is not about the run, and
             // idling here would drop a response in flight on that session.
-            if (msg.code !== 'NO_SUCH_TASK' && msg.code !== 'TASK_ID_REQUIRED' && msg.code !== 'TASK_STOP_FAILED') {
+            const desktopExecution = desktopExecutionsRef.current.get(sid) ?? getSessionActivity?.(sid)?.desktopExecution;
+            const externallyTracked = desktopExecution && desktopExecution.state !== 'completed' && desktopExecution.state !== 'failed';
+            if (!externallyTracked && msg.code !== 'NO_SUCH_TASK' && msg.code !== 'TASK_ID_REQUIRED' && msg.code !== 'TASK_STOP_FAILED' && msg.code !== 'DESKTOP_STOP_UNAVAILABLE') {
               onSessionIdle?.(sid);
             }
             sessionStore.appendRealtime(sid, {
@@ -339,6 +366,24 @@ export function useChatRealtimeHandlers({
           }
           accumulatedStreamRef.current = '';
 
+          const desktopExecution = sid
+            ? desktopExecutionsRef.current.get(sid) ?? getSessionActivity?.(sid)?.desktopExecution
+            : undefined;
+          if (sid && desktopExecution && desktopExecution.state !== 'completed' && desktopExecution.state !== 'failed') {
+            // `complete` can close only the web observer. Native queued work
+            // may still execute, even when this frame reports success/abort.
+            const uncertain: DesktopExecution = { ...desktopExecution, state: 'uncertain' };
+            desktopExecutionsRef.current.set(sid, uncertain);
+            onSessionProcessing?.(sid, { canInterrupt: false, desktopExecution: uncertain });
+            if (sid === activeViewSessionId) {
+              pendingPermissionRequestsRef.current = [];
+              setPendingPermissionRequests([]);
+              void requestLatestMessages(sid, isActiveRef.current);
+            }
+            break;
+          }
+          if (sid) desktopExecutionsRef.current.delete(sid);
+
           // `complete` is the unified terminal event — every provider run ends
           // with exactly one, regardless of success, failure, or abort. The
           // indicator derives from the processing map, so the entry changes
@@ -433,10 +478,11 @@ export function useChatRealtimeHandlers({
             if (sid === activeViewSessionId) {
               setTokenBudget(msg.tokenBudget as Record<string, unknown>);
             }
-          } else if (msg.text && sid) {
+          } else if ((msg.text || msg.desktopExecution) && sid) {
             onSessionProcessing?.(sid, {
-              statusText: msg.text as string,
+              statusText: msg.text,
               canInterrupt: msg.canInterrupt !== false,
+              ...(msg.desktopExecution ? { desktopExecution: msg.desktopExecution } : {}),
             });
           }
           break;

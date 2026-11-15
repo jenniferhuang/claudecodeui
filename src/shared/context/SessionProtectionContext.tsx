@@ -10,7 +10,7 @@ import type { ReactNode } from 'react';
 import {
   useSessionProtection,
 } from '@/shared/hooks/useSessionProtection';
-import type { BackgroundTaskSummary, GetSessionActivity, IsSessionProcessing, MarkSessionBackground, MarkSessionIdle, MarkSessionProcessing, SessionActivity, SessionActivityMap, SyncProcessingSessions } from '@/shared/types';
+import type { BackgroundTaskSummary, DesktopExecution, GetSessionActivity, IsSessionProcessing, MarkSessionBackground, MarkSessionIdle, MarkSessionProcessing, SessionActivity, SessionActivityMap, SyncProcessingSessions } from '@/shared/types';
 import { api } from '@/shared/api';
 
 type RunningSessionApiItem = {
@@ -18,6 +18,7 @@ type RunningSessionApiItem = {
   startedAt?: unknown;
   statusText?: unknown;
   canInterrupt?: unknown;
+  desktopExecution?: unknown;
   background?: unknown;
   tasks?: unknown;
 };
@@ -85,6 +86,22 @@ const parseStartedAt = (value: unknown): number | undefined => {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 };
+
+function parseDesktopExecution(value: unknown): DesktopExecution | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const execution = value as Partial<Record<keyof DesktopExecution, unknown>>;
+  if (
+    !['queued', 'running', 'uncertain', 'completed', 'failed'].includes(String(execution.state))
+    || typeof execution.requestId !== 'string'
+    || !execution.requestId
+    || !(execution.queueItemId === null || typeof execution.queueItemId === 'string')
+    || !(execution.turnId === null || typeof execution.turnId === 'string')
+  ) return undefined;
+  return {
+    state: execution.state as DesktopExecution['state'], requestId: execution.requestId,
+    queueItemId: execution.queueItemId, turnId: execution.turnId,
+  };
+}
 
 /** The poll's task list, kept only when every entry has the shape the indicator reads. */
 const parseBackgroundTasks = (value: unknown): BackgroundTaskSummary[] | undefined => {
@@ -154,6 +171,7 @@ export function SessionProtectionProvider({ children }: { children: ReactNode })
               startedAt: parseStartedAt(session.startedAt),
               statusText: typeof session.statusText === 'string' ? session.statusText : undefined,
               canInterrupt: typeof session.canInterrupt === 'boolean' ? session.canInterrupt : undefined,
+              desktopExecution: parseDesktopExecution(session.desktopExecution),
               background: session.background === true,
               tasks: parseBackgroundTasks(session.tasks),
             };

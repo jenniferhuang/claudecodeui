@@ -40,6 +40,7 @@ import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageLi
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
 import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
 import ComposerSendMenu from '@/modules/chat/composer/ComposerSendMenu';
+import DesktopExecutionBanner from '@/modules/chat/composer/DesktopExecutionBanner';
 
 type MentionableFile = {
   name: string;
@@ -62,6 +63,8 @@ type ChatComposerProps = {
   onAbortSession: () => void;
   /** Whether the viewed session can currently be interrupted; threaded to the send menu's Stop row, which otherwise looks actionable while `onAbortSession` already no-ops. Defaults to true so existing callers and tests, which never had a non-interruptible turn, keep working. */
   canAbortSession?: boolean;
+  /** Re-subscribes and refreshes the current session without submitting another request. */
+  onCheckExecutionStatus?: () => void;
   permissionMode: PermissionMode;
   availablePermissionModes: PermissionMode[];
   onSelectPermissionMode: (mode: PermissionMode) => void;
@@ -150,6 +153,7 @@ export default function ChatComposer({
   isLoading,
   onAbortSession,
   canAbortSession = true,
+  onCheckExecutionStatus,
   permissionMode,
   availablePermissionModes,
   onSelectPermissionMode,
@@ -218,6 +222,10 @@ export default function ChatComposer({
   sendByCtrlEnter,
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
+  const desktopExecution = activity?.desktopExecution;
+  const isDesktopExecuting = Boolean(desktopExecution && desktopExecution.state !== 'completed' && desktopExecution.state !== 'failed');
+  const isDesktopUncertain = desktopExecution?.state === 'uncertain';
+  const canInterrupt = canAbortSession && !isDesktopExecuting;
   const fileDropdownRef = useRef<HTMLDivElement | null>(null);
   const selectedFileRef = useRef<HTMLDivElement | null>(null);
   const commandMenuPosition = useMemo(() => {
@@ -266,7 +274,7 @@ export default function ChatComposer({
   }, []);
   const noopTranscript = useCallback(() => {}, []);
   const { state: voiceState, toggle: voiceToggle, stop: voiceStop } = useVoiceInput(
-    onVoiceTranscript ?? noopTranscript,
+    isDesktopUncertain ? noopTranscript : onVoiceTranscript ?? noopTranscript,
     handleVoiceError,
   );
   const isRecording = voiceState === 'recording';
@@ -274,13 +282,13 @@ export default function ChatComposer({
 
   // Detect if an interactive panel that takes the person's answer is active:
   // a question from the agent, or an MCP server's request for input.
-  const hasQuestionPanel = pendingPermissionRequests.some(
+  const hasQuestionPanel = !isDesktopExecuting && pendingPermissionRequests.some(
     (r) => r.toolName === 'AskUserQuestion' || r.toolName === MCP_ELICITATION_TOOL_NAME
   );
 
   // Hide the thinking/status bar while any permission request is pending
-  const hasPendingPermissions = pendingPermissionRequests.length > 0;
-  const hasActivityIndicator = Boolean(activity && !hasPendingPermissions);
+  const hasPendingPermissions = !isDesktopExecuting && pendingPermissionRequests.length > 0;
+  const hasActivityIndicator = Boolean(activity && !hasPendingPermissions && !isDesktopExecuting);
 
   const hasQueuedDraft = Boolean(queuedDraft);
   const hasAnyInput = Boolean(input.trim() || attachedFiles.length > 0);
@@ -299,13 +307,17 @@ export default function ChatComposer({
 
   return (
     <div className="chat-composer-shell relative flex-shrink-0 px-2 pb-2 pt-0 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
-      {!hasPendingPermissions && (
+      {!hasPendingPermissions && !isDesktopExecuting && (
         <div className="pointer-events-none absolute bottom-full left-1/2 z-10 w-[calc(100%-1rem)] max-w-[54.25rem] -translate-x-1/2 translate-y-px bg-transparent sm:w-[calc(100%-2rem)]">
           <ActivityIndicator activity={activity} onAbort={onAbortSession} isInputFocused={isInputFocused} />
         </div>
       )}
 
-      {pendingPermissionRequests.length > 0 && (
+      {isDesktopExecuting && desktopExecution && (
+        <DesktopExecutionBanner execution={desktopExecution} onCheckStatus={onCheckExecutionStatus} />
+      )}
+
+      {hasPendingPermissions && (
         <div className="mx-auto mb-3 max-w-[54.25rem]">
           <PermissionRequestsBanner
             pendingPermissionRequests={pendingPermissionRequests}
@@ -340,8 +352,8 @@ export default function ChatComposer({
       )}
 
       <BackgroundSendDialog
-        prompt={backgroundSendPrompt}
-        supportsSideQuestions={supportsSideQuestions}
+        prompt={isDesktopExecuting ? null : backgroundSendPrompt}
+        supportsSideQuestions={supportsSideQuestions && !isDesktopExecuting}
         hasText={Boolean(input.trim())}
         onResolve={onResolveBackgroundSendPrompt}
       />
@@ -412,7 +424,13 @@ export default function ChatComposer({
         />
 
         <PromptInput
-          onSubmit={onSubmit as (event: FormEvent<HTMLFormElement>) => void}
+          onSubmit={(event) => {
+            if (isDesktopUncertain) {
+              event.preventDefault();
+              return;
+            }
+            onSubmit(event);
+          }}
           status={isLoading ? 'streaming' : 'ready'}
           className={[
             isTextareaExpanded ? 'chat-input-expanded' : '',
@@ -468,7 +486,13 @@ export default function ChatComposer({
               value={input}
               onChange={onInputChange}
               onClick={onTextareaClick}
-              onKeyDown={onTextareaKeyDown}
+              onKeyDown={(event) => {
+                if ((isDesktopUncertain && event.key === 'Enter' && !event.shiftKey) || (isDesktopExecuting && event.key === 'Tab')) {
+                  event.preventDefault();
+                  return;
+                }
+                onTextareaKeyDown(event);
+              }}
               onPaste={onTextareaPaste}
               onScroll={(event) => onTextareaScrollSync(event.target as HTMLTextAreaElement)}
               onFocus={() => onInputFocusChange?.(true)}
@@ -488,7 +512,7 @@ export default function ChatComposer({
               <PaperclipIcon />
             </PromptInputButton>
 
-            {onVoiceTranscript && voiceAvailable && (
+            {onVoiceTranscript && voiceAvailable && !isDesktopUncertain && (
               <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} />
             )}
 
@@ -535,11 +559,12 @@ export default function ChatComposer({
 
           <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
             <ScheduleMessagePopover
-              disabled={!input.trim()}
+              disabled={!input.trim() || isDesktopUncertain}
               onSchedule={onScheduleMessage}
             />
 
             <ComposerModelMenu
+              key={isDesktopExecuting ? 'desktop-model' : 'web-model'}
               effort={effort}
               effortOptions={availableEffortOptions}
               onSelectEffort={onSelectEffort}
@@ -547,16 +572,19 @@ export default function ChatComposer({
               modelOptions={availableModelOptions}
               onSelectModel={onSelectModel}
               modelsLoading={modelsLoading}
+              disabled={isDesktopExecuting}
             />
 
             <ComposerPermissionMenu
+              key={isDesktopExecuting ? 'desktop-permissions' : 'web-permissions'}
               permissionMode={permissionMode}
               permissionModes={availablePermissionModes}
               onSelectPermissionMode={onSelectPermissionMode}
               providerLabel={providerLabel}
+              disabled={isDesktopExecuting}
             />
 
-            {(isLoading || activity?.background) && hasAnyInput && !isRecording && !isTranscribing ? (
+            {(isLoading || activity?.background) && hasAnyInput && !isRecording && !isTranscribing && !isDesktopUncertain ? (
               // The caret-trigger menu only replaces the plain button when there is
               // something to send: an empty composer during a turn keeps the
               // one-tap ■ Stop below, and an empty composer during background
@@ -565,9 +593,9 @@ export default function ChatComposer({
                 state={isLoading ? 'responding' : 'background'}
                 hasInput={hasAnyInput}
                 hasText={Boolean(input.trim())}
-                canAbortSession={canAbortSession}
-                supportsSideQuestions={supportsSideQuestions}
-                supportsSteering={supportsSteering}
+                canAbortSession={canInterrupt}
+                supportsSideQuestions={supportsSideQuestions && !isDesktopExecuting}
+                supportsSteering={supportsSteering && !isDesktopExecuting}
                 sendByCtrlEnter={sendByCtrlEnter}
                 onSelect={(choice) => {
                   if (choice === 'stop') {
@@ -580,7 +608,7 @@ export default function ChatComposer({
             ) : (
               <PromptInputSubmit
                 onClick={
-                  isTranscribing
+                  isDesktopUncertain || isTranscribing
                     ? undefined
                     : isLoading && !isRecording
                       ? onAbortSession
@@ -595,14 +623,14 @@ export default function ChatComposer({
                   // Transcribing shows the same spinner as a running turn, but it
                   // is not a turn: disable the button so a tap cannot reach
                   // `onAbortSession` and end an unrelated in-flight turn.
-                  isTranscribing
+                  isDesktopUncertain || isTranscribing
                     ? true
                     : isLoading
                       // With an empty composer this button is the one-tap Stop
                       // (see `onClick` above), so it disables on `canAbortSession`
                       // exactly like the send menu's Stop row does. Recording
                       // keeps its own voice-stop behavior either way.
-                      ? !isRecording && !canAbortSession
+                      ? !isRecording && !canInterrupt
                       : isRecording
                         ? false
                         : !hasAnyInput

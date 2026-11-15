@@ -207,6 +207,34 @@ export type ProviderSessionModel = {
   source: ProviderSessionModelSource;
 };
 
+//----------------- DESKTOP-OWNED CODEX SUBMISSIONS ------------
+
+/** Native owner-queue observation state; uncertain never establishes failure or safe retry. */
+export type CodexDesktopExecutionState = 'queued' | 'running' | 'uncertain' | 'completed' | 'failed';
+
+/** Used by Providers and WebSocket to report Desktop execution without implying web Stop or approval control. */
+export type CodexDesktopExecutionStatus = {
+  state: CodexDesktopExecutionState;
+  requestId: string;
+  queueItemId: string | null;
+  turnId: string | null;
+};
+
+/** Used by Database and Providers to reconcile one durable enqueue intent without automatically duplicating delivery. */
+export type CodexDesktopSubmission = CodexDesktopExecutionStatus & {
+  appSessionId: string;
+  nativeThreadId: string;
+  text: string;
+  transcriptPath: string;
+  clientMessageId: string;
+  createdAt: number;
+  updatedAt: number;
+  transcriptOffset: number;
+  error: string | null;
+};
+
+// ---------------------------
+
 /**
  * Message/event variants emitted by provider adapters and normalized transports.
  *
@@ -541,6 +569,8 @@ export type NormalizedMessage = {
   text?: string;
   tokens?: number;
   canInterrupt?: boolean;
+  /** Observation of a Desktop-owned turn; execution permissions remain with the Desktop owner. */
+  desktopExecution?: CodexDesktopExecutionStatus;
   requestId?: string;
   input?: unknown;
   context?: unknown;

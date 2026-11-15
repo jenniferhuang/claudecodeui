@@ -25,3 +25,6 @@ export { userPreferencesDb } from '@/modules/database/repositories/user-preferen
 export { vapidKeysDb } from '@/modules/database/repositories/vapid-keys.js';
 export { scheduledMessagesDb } from './repositories/scheduled-messages.db.js';
 export type { ScheduledMessageRow, ScheduledMessageStatus } from './repositories/scheduled-messages.db.js';
+
+// Providers use durable intent to prevent automatic native queue resends after ambiguous delivery.
+export { codexDesktopSubmissionsDb } from './repositories/codex-desktop-submissions.db.js';

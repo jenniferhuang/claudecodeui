@@ -1,10 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 
 import type { WebSocket } from 'ws';
 
-import { sessionsDb } from '@/modules/database/index.js';
+import { codexDesktopSubmissionsDb, sessionsDb } from '@/modules/database/index.js';
+import { getCodexDesktopQueueDelegationAllowed } from '@/modules/filesystem-policy/index.js';
 import {
+  codexDesktopQueueService,
   MAX_CONCURRENT_SIDE_QUESTIONS_PER_SESSION,
   providerCapabilitiesService,
   providerModelsService,
@@ -12,6 +15,7 @@ import {
   sideQuestionsService,
 } from '@/modules/providers/index.js';
 import { chatRunRegistry, notifyRunSettled } from '@/modules/websocket/services/chat-run-registry.service.js';
+import { inspectCodexDesktopOwner } from '@/modules/websocket/services/codex-shell-identity.service.js';
 import { hasActiveCodexShellSession, refreshCodexShellSessionOwnership } from '@/modules/websocket/services/shell-websocket.service.js';
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import {
@@ -22,6 +26,7 @@ import {
 } from '@/shared/image-attachments.js';
 import type {
   AnyRecord,
+  CodexDesktopExecutionStatus,
   AuthenticatedWebSocketRequest,
   LLMProvider,
   ProviderPermissionDecision,
@@ -30,7 +35,7 @@ import type {
   SideQuestionEvent,
   SideQuestionRuntime,
 } from '@/shared/types.js';
-import { parseIncomingJsonObject, SIDE_QUESTION_ID_PATTERN } from '@/shared/utils.js';
+import { createNormalizedMessage, parseIncomingJsonObject, SIDE_QUESTION_ID_PATTERN } from '@/shared/utils.js';
 
 /**
  * Trust boundary for client-supplied image attachments: chat.send options come
@@ -93,14 +98,37 @@ export type ProviderRuntimeGateway = SideQuestionRuntime & {
   getPendingApprovalsForSession(sessionId: string): unknown[];
 };
 
+type CodexOwnerGateway = {
+  refreshOwnership: typeof refreshCodexShellSessionOwnership;
+  inspectDesktopOwner: typeof inspectCodexDesktopOwner;
+  isDesktopDelegationAllowed: () => boolean;
+  queue: Pick<typeof codexDesktopQueueService, 'run' | 'getActiveStatus' | 'reconcile'>;
+};
+
+const codexOwnerGateway: CodexOwnerGateway = {
+  refreshOwnership: refreshCodexShellSessionOwnership,
+  inspectDesktopOwner: inspectCodexDesktopOwner,
+  isDesktopDelegationAllowed: getCodexDesktopQueueDelegationAllowed,
+  // Providers and WebSocket already share a registry dependency. Resolve the
+  // service lazily so loading history first cannot read an uninitialized export.
+  get queue() { return codexDesktopQueueService; },
+};
+
 type ChatWebSocketDependencies = {
   /** Central dispatcher for every provider SDK/CLI runtime. */
   runtime: ProviderRuntimeGateway;
+  /** Server-owned native admission boundary; never derived from browser run options. */
+  codexOwner?: CodexOwnerGateway;
 };
 
 // A provider may emit `complete` before its CLI/SDK promise exits. Keep the
 // Codex reservation through that final cleanup, not just through the UI turn.
 const activeCodexChatSessions = new Set<string>();
+
+// The native executor is selected before startRun exposes a web run and before
+// async attestation/transcript reads can persist its intent. Abort paths must
+// honor this reservation throughout that gap as well as the durable ledger.
+const desktopOwnedCodexChatSessions = new Set<string>();
 
 /** Used by the websocket gateway to defer Shell launches until the Codex Chat runtime has released its writer. */
 export function isCodexChatSessionActive(sessionId: string): boolean {
@@ -275,6 +303,31 @@ async function dispatchRun(
   if (session.provider !== 'codex') {
     return dispatchReservedRun(ws, userId, sessionId, session, data, dependencies, extraRuntimeOptions, beforeRun);
   }
+  const ownerGateway = dependencies.codexOwner ?? codexOwnerGateway;
+  const clientOptions = (data.options ?? {}) as AnyRecord;
+  const requestedId = data.requestId ?? data.messageId ?? clientOptions.requestId;
+  const requestId = typeof requestedId === 'string' && UUID_PATTERN.test(requestedId) ? requestedId : null;
+  const text = typeof data.content === 'string' ? data.content : '';
+  const previous = requestId ? codexDesktopSubmissionsDb.getByRequestId(requestId) : null;
+  // A request's delivery identity survives owner release and server restart.
+  // Resolve it before choosing an ordinary runtime, which has no native queue deduplication.
+  if (previous && (previous.appSessionId !== sessionId || previous.nativeThreadId !== session.provider_session_id
+    || previous.text !== text || previous.transcriptPath !== session.jsonl_path)) {
+    const error = 'This request id belongs to a different Desktop submission.';
+    if (ws) sendProtocolError(ws, 'CODEX_QUEUE_REQUEST_CONFLICT', error, sessionId);
+    return { started: false, error };
+  }
+  const outstanding = ownerGateway.queue.getActiveStatus(sessionId) ??
+    (previous && previous.state !== 'completed' && previous.state !== 'failed' ? {
+      state: previous.state, requestId: previous.requestId, queueItemId: previous.queueItemId, turnId: previous.turnId,
+    } : null);
+  if (outstanding) {
+    const error = 'A previous Desktop submission is still queued, running, or unconfirmed. Check its status before sending another message.';
+    if (ws) sendProtocolError(ws, 'DESKTOP_DELIVERY_UNCONFIRMED', error, sessionId, {
+      desktopExecution: outstanding, canInterrupt: false,
+    });
+    return { started: false, error, retryable: true };
+  }
   const identities = new Set([sessionId, session.provider_session_id].filter((id): id is string => Boolean(id)));
   if (Array.from(identities).some((id) => isCodexChatSessionActive(id))) {
     const error = 'The previous Codex run is still releasing this session. Please retry when it has finished.';
@@ -286,11 +339,65 @@ async function dispatchRun(
   for (const id of identities) activeCodexChatSessions.add(id);
   let runtimeStarted = false;
   try {
+    const hasAttachments = [clientOptions.images, clientOptions.files, clientOptions.attachments]
+      .some(value => Array.isArray(value) && value.length > 0);
+    const unsupportedDesktopInput = hasAttachments || beforeRun || Object.keys(extraRuntimeOptions).length > 0 || !session.jsonl_path;
+    if (previous) {
+      if (unsupportedDesktopInput) {
+        const error = 'A Desktop request id cannot be reused for attachments or history edits.';
+        if (ws) sendProtocolError(ws, 'DESKTOP_QUEUE_UNSUPPORTED_INPUT', error, sessionId);
+        return { started: false, error };
+      }
+      // A terminal ledger record is replayed without another native submission,
+      // even when Desktop released ownership or delegation was since disabled.
+      desktopOwnedCodexChatSessions.add(sessionId);
+      const result = await dispatchReservedRun(ws, userId, sessionId, session, data, dependencies, {}, undefined,
+        writer => ownerGateway.queue.run({
+          appSessionId: sessionId, nativeThreadId: previous.nativeThreadId, requestId: previous.requestId,
+          text: previous.text, transcriptPath: previous.transcriptPath, writer,
+        }));
+      runtimeStarted = result.started;
+      return result;
+    }
     // Fresh Shells learn their native id after startup. Only positively
     // associated identities block this thread; an unknown owner is not a
     // global Codex lock. Recheck synchronously after the discovery await.
-    const ownership = await refreshCodexShellSessionOwnership(sessionId, session.provider_session_id);
+    const ownership = await ownerGateway.refreshOwnership(sessionId, session.provider_session_id);
     if (ownership === 'writer-held') {
+      const nativeThreadId = session.provider_session_id;
+      const codexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+      const owner = nativeThreadId ? await ownerGateway.inspectDesktopOwner(nativeThreadId, codexHome) : null;
+      if (owner && nativeThreadId) {
+        if (!ownerGateway.isDesktopDelegationAllowed()) {
+          const error = 'Codex Desktop owns this thread. The server administrator must explicitly enable Desktop queue delegation in filesystem policy; Desktop does not inherit CloudCLI file permissions.';
+          if (ws) sendProtocolError(ws, 'DESKTOP_DELEGATION_DISABLED', error, sessionId);
+          return { started: false, error };
+        }
+        if (unsupportedDesktopInput) {
+          const error = 'Desktop queue routing supports text-only normal sends with an indexed transcript. Attachments and history edits require releasing Desktop ownership first.';
+          if (ws) sendProtocolError(ws, 'DESKTOP_QUEUE_UNSUPPORTED_INPUT', error, sessionId);
+          return { started: false, error };
+        }
+        if (!text.trim()) {
+          const error = 'Desktop queue routing requires a non-empty text message.';
+          if (ws) sendProtocolError(ws, 'MESSAGE_REQUIRED', error, sessionId);
+          return { started: false, error };
+        }
+        const submissionRequestId = requestId ?? randomUUID();
+        desktopOwnedCodexChatSessions.add(sessionId);
+        const result = await dispatchReservedRun(ws, userId, sessionId, session, data, dependencies, {}, undefined,
+          async (writer) => {
+            // A native queue addresses the thread, not a PID. Re-attest after
+            // reserving this run; a changed owner must not inherit an old decision.
+            const current = await ownerGateway.inspectDesktopOwner(nativeThreadId, codexHome);
+            if (!current || current.identity !== owner.identity || current.pid !== owner.pid) {
+              throw new Error('The Desktop owner changed before submission. No message was queued; check the session owner again.');
+            }
+            await ownerGateway.queue.run({ appSessionId: sessionId, nativeThreadId, requestId: submissionRequestId, text, transcriptPath: session.jsonl_path!, writer });
+          });
+        runtimeStarted = result.started;
+        return result;
+      }
       const error = "Another Codex process holds this thread's writer lock, even if its last turn has finished. Release the thread in the owning app or exit that Codex session, then retry.";
       if (ws) sendProtocolError(ws, 'RUN_IN_PROGRESS', error, sessionId);
       return { started: false, error, retryable: true };
@@ -306,6 +413,7 @@ async function dispatchRun(
     runtimeStarted = result.started;
     return result;
   } finally {
+    desktopOwnedCodexChatSessions.delete(sessionId);
     for (const id of identities) activeCodexChatSessions.delete(id);
     // `complete` can precede process cleanup. Its first notification leaves
     // queued messages untouched; this one makes them eligible after release.
@@ -328,6 +436,7 @@ async function dispatchReservedRun(
   dependencies: ChatWebSocketDependencies,
   extraRuntimeOptions: AnyRecord = {},
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
+  executeOwnedTurn?: (writer: ProviderRuntimeWriter) => Promise<void>,
 ): Promise<ChatDispatchResult> {
   const provider = session.provider as LLMProvider;
 
@@ -357,10 +466,10 @@ async function dispatchReservedRun(
   // Record what this turn runs with so reopening the session later restores the
   // same model and reasoning effort, and so the resume path has a
   // session-scoped model answer to use.
-  if (typeof clientOptions.model === 'string' && clientOptions.model.trim()) {
+  if (!executeOwnedTurn && typeof clientOptions.model === 'string' && clientOptions.model.trim()) {
     providerModelsService.setSessionModel(provider, sessionId, clientOptions.model);
   }
-  if (typeof clientOptions.effort === 'string' && clientOptions.effort.trim()) {
+  if (!executeOwnedTurn && typeof clientOptions.effort === 'string' && clientOptions.effort.trim()) {
     providerModelsService.setSessionEffort(provider, sessionId, clientOptions.effort);
   }
 
@@ -392,10 +501,14 @@ async function dispatchReservedRun(
     // be taken back. Inside the try so a rewind that throws still releases the
     // run instead of leaving the session processing forever.
     await beforeRun?.(run);
-    await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
+    if (executeOwnedTurn) await executeOwnedTurn(run.writer);
+    else await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
     console.error(`[Chat] Provider runtime "${provider}" failed`, { sessionId, error: failure });
+    if (executeOwnedTurn) {
+      run.writer.send(createNormalizedMessage({ provider, sessionId, kind: 'error', content: failure, isError: true }));
+    }
   } finally {
     // Safety net: a runtime that crashed (or resolved) without emitting its
     // terminal `complete` would otherwise leave the session stuck in
@@ -751,6 +864,14 @@ async function handleChatAbort(
     return;
   }
 
+  const desktopExecution = (dependencies.codexOwner ?? codexOwnerGateway).queue.getActiveStatus(sessionId);
+  if (desktopOwnedCodexChatSessions.has(sessionId) || desktopExecution) {
+    sendProtocolError(ws, 'DESKTOP_STOP_UNAVAILABLE',
+      'This request belongs to the native session owner. Stop it in the owning app; CloudCLI cannot confirm cancellation.', sessionId,
+      { canInterrupt: false, ...(desktopExecution ? { desktopExecution } : {}) });
+    return;
+  }
+
   const run = chatRunRegistry.getRun(sessionId);
   if (!run || run.status !== 'running') {
     sendProtocolError(ws, 'NO_ACTIVE_RUN', `Session "${sessionId}" has no active run.`, sessionId);
@@ -831,11 +952,11 @@ async function handleChatStopTask(
  * This single message replaces the old `check-session-status`,
  * `get-pending-permissions`, and Claude-only writer reconnect flows.
  */
-function handleChatSubscribe(
+async function handleChatSubscribe(
   ws: WebSocket,
   data: AnyRecord,
   dependencies: ChatWebSocketDependencies
-): void {
+): Promise<void> {
   const targets = Array.isArray(data.sessions) ? data.sessions : [];
 
   for (const target of targets) {
@@ -871,13 +992,19 @@ function handleChatSubscribe(
     // Pending approvals are tracked under the app session id inside the
     // Claude runtime, so they can be looked up directly.
     const pendingPermissions = dependencies.runtime.getPendingApprovalsForSession(sessionId);
+    // Status reconciliation is read-only: it never re-enqueues an uncertain request.
+    let desktopExecution: CodexDesktopExecutionStatus | null = null;
+    if (sessionsDb.getSessionById(sessionId)?.provider === 'codex') {
+      desktopExecution = await (dependencies.codexOwner ?? codexOwnerGateway).queue.reconcile(sessionId);
+    }
 
     sendJson(ws, {
       kind: 'chat_subscribed',
       sessionId,
-      isProcessing,
+      isProcessing: isProcessing || Boolean(desktopExecution && desktopExecution.state !== 'completed' && desktopExecution.state !== 'failed'),
       lastSeq: run?.lastSeq ?? 0,
       pendingPermissions,
+      ...(desktopExecution ? { desktopExecution, canInterrupt: false } : {}),
       timestamp: new Date().toISOString(),
     });
 
@@ -966,10 +1093,28 @@ export async function runDetachedChatTurn(
     return { started: false, error: `Provider "${provider}" is not available.` };
   }
 
+  const data = { sessionId: input.sessionId, content: input.content, options: input.options ?? {} };
+  const requestedId = input.options?.requestId;
+  if (provider === 'codex' && typeof requestedId === 'string' && UUID_PATTERN.test(requestedId)
+    && codexDesktopSubmissionsDb.getByRequestId(requestedId)) {
+    // A recovered schedule can replay an old delivery after a newer web run
+    // starts. Resolve its durable replay/conflict before any destructive abort;
+    // dispatchRun keeps an active later run reserved until it actually finishes.
+    return dispatchRun(null, input.userId, input.sessionId, session, data, dependencies);
+  }
+
   const activeRun = chatRunRegistry.getRun(input.sessionId);
   if (activeRun && activeRun.status === 'running') {
     if (!input.interruptActiveRun) {
       return { started: false, error: 'A run was already in progress for this session.', retryable: true };
+    }
+    if (desktopOwnedCodexChatSessions.has(input.sessionId)
+      || (dependencies.codexOwner ?? codexOwnerGateway).queue.getActiveStatus(input.sessionId)) {
+      return {
+        started: false,
+        error: 'The native session owner is still executing or delivery is unconfirmed. Scheduled interruption cannot stop it.',
+        retryable: true,
+      };
     }
     // Same shape as `chat.abort`: cancel the provider run and emit the
     // terminal `complete` on its behalf, so every watching client sees the
@@ -988,7 +1133,7 @@ export async function runDetachedChatTurn(
     input.userId,
     input.sessionId,
     session,
-    { sessionId: input.sessionId, content: input.content, options: input.options ?? {} },
+    data,
     dependencies,
   );
 }
@@ -1033,7 +1178,7 @@ export function handleChatConnection(
           await handleChatStopTask(ws, data, dependencies);
           return;
         case 'chat.subscribe':
-          handleChatSubscribe(ws, data, dependencies);
+          await handleChatSubscribe(ws, data, dependencies);
           return;
         case 'chat.permission-response':
           handlePermissionResponse(data, dependencies);

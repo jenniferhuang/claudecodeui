@@ -27,3 +27,6 @@ export {
   MAX_SIDE_QUESTIONS_PER_SESSION,
   sideQuestionsService,
 } from './services/side-questions.service.js';
+
+// WebSocket routes Desktop-owned Codex submissions through the native owner queue.
+export { codexDesktopQueueService } from './services/codex-desktop-queue.service.js';

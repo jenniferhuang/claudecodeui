@@ -180,6 +180,10 @@ function ChatInterface({
     sessionStore,
   });
 
+  const isDesktopExecuting = Boolean(sessionActivity?.desktopExecution
+    && sessionActivity.desktopExecution.state !== 'completed'
+    && sessionActivity.desktopExecution.state !== 'failed');
+
   // Brand-new conversation: the composer allocated a stable session id via
   // the session gateway before the first send. Record it locally and put it
   // in the URL — this id never changes again, so there is no later handoff.
@@ -303,7 +307,7 @@ function ChatInterface({
     sendMessage,
     isConnected,
     sendByCtrlEnter,
-    supportsSteering,
+    supportsSteering: supportsSteering && !isDesktopExecuting,
     onSessionProcessing,
     onSessionEstablished: handleSessionEstablished,
     onFileOpen,
@@ -314,7 +318,7 @@ function ChatInterface({
     setIsUserScrolledUp,
     setPendingPermissionRequests,
     resolvePermissionModeForProvider,
-    supportsSideQuestions,
+    supportsSideQuestions: supportsSideQuestions && !isDesktopExecuting,
   });
 
   // On WebSocket reconnect, request a bounded persisted-tail sync (deferred
@@ -463,25 +467,27 @@ function ChatInterface({
   // A composer pick becomes the default for new chats and, when a session is
   // open, is recorded against that session so reopening it restores this model.
   const handleSelectComposerModel = useCallback(async (model: string) => {
+    if (isDesktopExecuting) return;
     try {
       await selectProviderModel(provider, model, currentSessionId || selectedSession?.id || null);
     } catch (error) {
       console.error('Error changing the active session model:', error);
     }
-  }, [currentSessionId, provider, selectProviderModel, selectedSession?.id]);
+  }, [currentSessionId, isDesktopExecuting, provider, selectProviderModel, selectedSession?.id]);
 
   const handleSelectComposerEffort = useCallback(async (effort: string) => {
+    if (isDesktopExecuting) return;
     try {
       await selectProviderEffort(provider, effort, currentSessionId || selectedSession?.id || null);
     } catch (error) {
       console.error('Error changing the active session reasoning effort:', error);
     }
-  }, [currentSessionId, provider, selectProviderEffort, selectedSession?.id]);
+  }, [currentSessionId, isDesktopExecuting, provider, selectProviderEffort, selectedSession?.id]);
 
   // Mirrors ChatComposer's own visibility check so the message pane can
   // reserve enough bottom space to keep the floating status tab from
   // overlapping the last message.
-  const hasActivityIndicator = Boolean(sessionActivity && pendingPermissionRequests.length === 0);
+  const hasActivityIndicator = Boolean(sessionActivity && !isDesktopExecuting && pendingPermissionRequests.length === 0);
 
   const selectedProviderLabel =
     provider === 'cursor'
@@ -595,6 +601,7 @@ function ChatInterface({
           isLoading={isProcessing}
           onAbortSession={handleAbortSession}
           canAbortSession={canAbortSession}
+          onCheckExecutionStatus={() => { void handleWebSocketReconnect(); }}
           permissionMode={permissionMode}
           availablePermissionModes={availablePermissionModes}
           onSelectPermissionMode={selectPermissionMode}

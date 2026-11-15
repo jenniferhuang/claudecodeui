@@ -50,7 +50,7 @@ const renderComposer = (
   processingSessions?: SessionActivityMap,
   { isLoading = false, supportsSteering = false } = {},
 ) => {
-  const sent: Array<{ type: string; sessionId?: string; content?: string; anchorId?: string }> = [];
+  const sent: Array<{ type: string; sessionId?: string; content?: string; anchorId?: string; requestId?: string }> = [];
   let rerender: ((props: Props) => void) | undefined;
   const view = renderHook(({ session }: Props) =>
     useChatComposerState({
@@ -88,6 +88,42 @@ const renderComposer = (
 
 const submit = (view: ReturnType<typeof renderComposer>['view']) =>
   view.result.current.handleSubmit({ preventDefault: () => undefined } as never);
+
+test('each normal send carries its own UUID and a rerender never retries a sent message', async () => {
+  const { view, chatSends } = renderComposer(SESSION_A);
+  await act(async () => { view.result.current.setInput('first request'); });
+  await act(async () => { await submit(view); });
+  const firstId = chatSends()[0]?.requestId;
+  assert.match(String(firstId), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  view.rerender({ session: SESSION_A });
+  assert.equal(chatSends().length, 1);
+  await act(async () => { view.result.current.setInput('second request'); });
+  await act(async () => { await submit(view); });
+  assert.notEqual(chatSends()[1]?.requestId, firstId);
+});
+
+test('dispatching an existing queued message retains its persisted request identity', async () => {
+  const { view, chatSends } = renderComposer(SESSION_A);
+  await act(async () => {
+    await view.result.current.handleSubmit({ preventDefault: () => undefined } as never, {
+      content: 'durable queued message', attachments: [],
+      options: { requestId: 'edfa9265-cc32-4752-bcc8-c7eb8ad0bc81' },
+    });
+  });
+  assert.equal(chatSends()[0]?.requestId, 'edfa9265-cc32-4752-bcc8-c7eb8ad0bc81');
+});
+
+test('an uncertain native request leaves a new draft unsent and unqueued at the send boundary', async () => {
+  const { view, chatSends } = renderComposer(SESSION_A, new Map([['session-a', {
+    statusText: 'Native execution uncertain', canInterrupt: false, startedAt: 1,
+    desktopExecution: { state: 'uncertain', requestId: 'r1', queueItemId: null, turnId: null },
+  }]]), { isLoading: true });
+  await act(async () => { view.result.current.setInput('Keep this unsent'); });
+  await act(async () => { await submit(view); });
+  assert.equal(chatSends().length, 0);
+  assert.equal(view.result.current.queuedDraft, null);
+  assert.equal(view.result.current.input, 'Keep this unsent');
+});
 
 beforeEach(() => {
   pendingUploads = [];

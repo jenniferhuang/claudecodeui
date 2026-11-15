@@ -23,6 +23,25 @@ beforeEach(() => {
   runningSessions.mockReset();
 });
 
+test('a fresh page restores the external Desktop lifecycle from the running-sessions poll', async () => {
+  runningSessions.mockResolvedValue({
+    ok: true,
+    json: async () => ({ data: { sessions: [{
+      sessionId: 'desktop-session', startedAt: 1_700_000_000_000, canInterrupt: false,
+      desktopExecution: { state: 'uncertain', requestId: 'r1', queueItemId: 'q1', turnId: null },
+    }] } }),
+  });
+  const { SessionProtectionProvider, useProcessingSessions } = await import('@/shared/context/SessionProtectionContext');
+  const wrapper = ({ children }: { children: React.ReactNode }) =>
+    React.createElement(SessionProtectionProvider, null, children);
+  const { result } = renderHook(() => useProcessingSessions(), { wrapper });
+  await waitFor(() => assert.ok(result.current.get('desktop-session')));
+  assert.deepEqual(result.current.get('desktop-session')?.desktopExecution, {
+    state: 'uncertain', requestId: 'r1', queueItemId: 'q1', turnId: null,
+  });
+  assert.equal(result.current.get('desktop-session')?.canInterrupt, false);
+});
+
 test('the poll carries each task through whole, nested flag included', async () => {
   runningSessions.mockResolvedValue({
     ok: true,

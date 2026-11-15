@@ -8,9 +8,11 @@ import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { listBusyClaudeCliSessions } from '@/modules/providers/services/claude-cli-liveness.service.js';
 import { providerCapabilitiesService } from '@/modules/providers/services/provider-capabilities.service.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
+import { codexDesktopQueueService } from '@/modules/providers/services/codex-desktop-queue.service.js';
 import type {
   BackgroundTaskSummary,
   ClearedContextSegment,
+  CodexDesktopExecutionStatus,
   FetchHistoryOptions,
   FetchHistoryResult,
   LLMProvider,
@@ -43,6 +45,8 @@ type RunningSessionEntry = {
   canInterrupt?: false;
   statusText?: string;
   tasks?: BackgroundTaskSummary[];
+  /** Native owner observation; these turns cannot be stopped by CloudCLI's SDK. */
+  desktopExecution?: CodexDesktopExecutionStatus;
 };
 
 type CreateAppSessionResult = {
@@ -296,6 +300,26 @@ export const sessionsService = {
   async listRunningSessions(): Promise<RunningSessionEntry[]> {
     const entries: RunningSessionEntry[] = chatRunRegistry.listRunningRuns();
     const runningById = new Map(entries.map((entry) => [entry.sessionId, entry]));
+
+    for (const submission of codexDesktopQueueService.listActive()) {
+      const entry = runningById.get(submission.appSessionId);
+      const observation = {
+        desktopExecution: submission.status,
+        canInterrupt: false as const,
+        statusText: submission.status.state === 'uncertain'
+          ? 'Desktop delivery or completion is unconfirmed. Check status; do not resend.'
+          : 'Queued for or running in Codex Desktop. Desktop permissions apply; web Stop is unavailable.',
+      };
+      if (entry) Object.assign(entry, observation);
+      else {
+        const restored = {
+          sessionId: submission.appSessionId, provider: 'codex' as const,
+          startedAt: submission.startedAt, lastSeq: 0, ...observation,
+        };
+        entries.push(restored);
+        runningById.set(restored.sessionId, restored);
+      }
+    }
 
     for (const provider of providerRegistry.listProviders()) {
       for (const { sessionId, tasks } of provider.runtime.listBackgroundWork?.() ?? []) {

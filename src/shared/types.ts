@@ -193,11 +193,27 @@ export type BackgroundTaskSummary = {
   nested?: boolean;
 };
 
+/**
+ * A website request queued after verifying Desktop held the native thread. Its
+ * native identifiers correlate queue admission and persisted history; an
+ * uncertain state means execution may still occur and must not be retried.
+ * The queue addresses the thread, so its owner can change. That owner uses
+ * its own settings and permissions, outside web controls.
+ */
+export type DesktopExecution = {
+  state: 'queued' | 'running' | 'uncertain' | 'completed' | 'failed';
+  requestId: string;
+  queueItemId: string | null;
+  turnId: string | null;
+};
+
 /** What a busy session is doing, as shown by the activity indicator: producing a response, or only running background tasks. */
 export type SessionActivity = {
   /** Provider-supplied status line; null renders the default activity label. */
   statusText: string | null;
   canInterrupt: boolean;
+  /** Present while this session's request is being tracked through its Desktop owner. */
+  desktopExecution?: DesktopExecution;
   /**
    * When this request was first marked as processing (client clock). Drives
    * the elapsed-time display and the stale `chat_subscribed` idle-ack guard.
@@ -220,7 +236,7 @@ export type SessionActivityMap = ReadonlyMap<string, SessionActivity>;
 /** Marks a session as producing a response; call it as soon as a send is dispatched so the UI reacts immediately. */
 export type MarkSessionProcessing = (
   sessionId?: string | null,
-  activity?: { statusText?: string | null; canInterrupt?: boolean },
+  activity?: { statusText?: string | null; canInterrupt?: boolean; desktopExecution?: DesktopExecution },
 ) => void;
 
 /** Marks a session's response as finished; `ifStartedBefore` lets a late acknowledgement clear only a stale run. Leaves background-only work alone, which it says nothing about. */
@@ -251,6 +267,7 @@ export type SessionActivitySnapshot = {
   sessionId: string;
   statusText?: string | null;
   canInterrupt?: boolean;
+  desktopExecution?: DesktopExecution;
   startedAt?: number;
   /** True when the server lists the session for its background tasks alone, with no chat run. */
   background?: boolean;
@@ -273,6 +290,10 @@ export type ServerEvent = {
   type?: string;
   sessionId?: string;
   seq?: number;
+  text?: string;
+  canInterrupt?: boolean;
+  /** Desktop-owned execution state belongs only to this event's explicit sessionId. */
+  desktopExecution?: DesktopExecution;
   [key: string]: unknown;
 };
 
@@ -635,6 +656,8 @@ export type NormalizedMessage = {
   text?: string;
   tokens?: number;
   canInterrupt?: boolean;
+  /** Desktop-owned execution state, keyed by this event's explicit sessionId. */
+  desktopExecution?: DesktopExecution;
   tokenBudget?: unknown;
   requestId?: string;
   input?: unknown;

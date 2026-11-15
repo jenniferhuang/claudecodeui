@@ -1,1 +1,1 @@
-export { initializeFilesystemPolicy } from './filesystem-policy-bootstrap.service.js';
+export { getCodexDesktopQueueDelegationAllowed, initializeFilesystemPolicy } from './filesystem-policy-bootstrap.service.js';

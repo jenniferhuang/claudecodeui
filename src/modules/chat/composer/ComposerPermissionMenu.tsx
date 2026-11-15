@@ -84,6 +84,8 @@ type ComposerPermissionMenuProps = {
   permissionModes: PermissionMode[];
   onSelectPermissionMode: (mode: PermissionMode) => void;
   providerLabel: string;
+  /** Desktop-owned execution controls its permissions in Desktop. */
+  disabled?: boolean;
 };
 
 /**
@@ -95,6 +97,7 @@ function ComposerPermissionMenu({
   permissionModes,
   onSelectPermissionMode,
   providerLabel,
+  disabled = false,
 }: ComposerPermissionMenuProps) {
   const { t } = useTranslation('chat');
   const [isOpen, setIsOpen] = useState(false);
@@ -129,11 +132,12 @@ function ComposerPermissionMenu({
       <button
         ref={triggerRef}
         type="button"
+        disabled={disabled}
         onClick={() => {
           updateAnchor();
           setIsOpen((current) => !current);
         }}
-        className={`flex h-8 min-w-8 max-w-40 shrink-0 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition-colors sm:max-w-48 ${isNameShown ? 'px-2' : 'w-8'} ${activeAppearance.trigger}`}
+        className={`flex h-8 min-w-8 max-w-40 shrink-0 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 sm:max-w-48 ${isNameShown ? 'px-2' : 'w-8'} ${activeAppearance.trigger}`}
         aria-haspopup="menu"
         aria-expanded={isOpen}
         // The mode name leads the accessible name, so what a screen reader
@@ -150,7 +154,7 @@ function ComposerPermissionMenu({
         {isNameShown && <span className="truncate">{activeModeLabel}</span>}
       </button>
 
-      {isOpen && anchor && createPortal(
+      {isOpen && !disabled && anchor && createPortal(
         <ComposerMenuSurface anchor={anchor} menuRef={menuRef} ariaLabel={heading}>
           <ComposerMenuHeading>{heading}</ComposerMenuHeading>
           {permissionModes.map((mode) => {
